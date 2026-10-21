@@ -9,14 +9,14 @@ Two [LangGraph](https://langchain-ai.github.io/langgraph/) graphs on FastAPI, de
 
 PayPal is the source of truth in both graphs, and nothing that moves money happens without the seller approving it.
 
-> **Status: week 1 of 4 (Foundations).** Webhook intake works end to end. Seller authentication and authorization are in progress. Both graphs and the board UI are still to build. See [CHANGES.md](CHANGES.md) for what is done and [RECHECK.md](RECHECK.md) for open code-review points.
+> **Status: week 2 of 4 (`scam_check`).** Webhook intake works end to end. The `scam_check` graph and `POST /scam-check` are built and tested, with PayPal and the LLM mocked. Seller authentication and authorization are in progress. `dispute_defense` and the board UI are still to build. See [CHANGES.md](CHANGES.md) for what is done and [RECHECK.md](RECHECK.md) for open code-review points.
 
 | Area | Status |
 |---|---|
 | Webhook intake: signature check and dedupe (`/webhooks/paypal`) | Done (tests U11, U12, S07) |
 | Postgres storage, Render blueprint | Done (`render.yaml` written) |
 | Seller authentication, single-use approval tokens | In progress |
-| `scam_check` graph | Planned, 25–31 Oct |
+| `scam_check` graph and `POST /scam-check` | Done (U01–U05, U09–U10, U17–U20, N01–N04, S01–S06). Paste page and screenshots planned |
 | `dispute_defense` graph, approval screen, Bryntum board | Planned, 1–7 Nov |
 | Evaluation set, published numbers, demo video | Planned, 8–12 Nov |
 
@@ -48,17 +48,30 @@ flowchart TD
   H -- fail --> J[safe_template] --> I
 ```
 
-`verify_payment` tries, in order: the capture API (`GET /v2/payments/captures/{id}`), the webhook-fed `payment_ledger`, then Transaction Search (which can lag by hours). `compute_verdict` is a pure function with no LLM, and it is the only node that writes `state.verdict`.
+`extract_claims` takes up to three 17-character transaction IDs from the chat, using a regex and no LLM. `verify_payment` tries each one against the capture API (`GET /v2/payments/captures/{id}`), then Transaction Search (which can lag by hours).
+
+The webhook-fed ledger is not consulted yet. Stored bodies are only CRC32-bound (RECHECK #2), and refund events don't carry the capture ID, so a ledger hit could approve a refunded or forged payment.
+
+A PayPal 403, 429, 5xx, timeout or token failure counts as "unavailable", never as "not found". The amount is compared only to the seller's `expected_amount` and `expected_currency`, never to what the buyer claims.
+
+`compute_verdict` is a pure function with no LLM, and it is the only node that writes `state.verdict`.
 
 | Payment (API) | Signals | Verdict | Message to seller |
 |---|---|---|---|
-| Found, amount matches, `COMPLETED` | 0 | `VERIFIED` | You can ship. |
-| Found, amount matches, `COMPLETED` | ≥ 1 | `VERIFIED_WITH_WARNINGS` | Real payment. Don't refund differences outside PayPal. |
-| Found but `PENDING`, or amount differs | any | `WAIT` | Don't ship yet. |
-| Not found, or API unavailable | 0–1 | `WAIT` | Not confirmed. Wait and check again. |
-| Not found | ≥ 2 | `SCAM_LIKELY` | Don't ship the item. |
+| Found, `COMPLETED`, amount matches | none (checked) | `VERIFIED` | You can ship. Ship only to the address on this payment's Transaction Details page in PayPal. |
+| Found, `COMPLETED`, amount matches | any, or the check failed | `VERIFIED_WITH_WARNINGS` | Real payment. Ship only to the address on its Transaction Details page in PayPal, and don't refund differences outside PayPal. |
+| Found, `DECLINED`, `FAILED`, `REFUNDED`, `PARTIALLY_REFUNDED` or `REVERSED` | any | `WAIT` | Don't ship. This payment was declined, failed or refunded. |
+| Found, `PENDING`, or amount differs | any | `WAIT` | Don't ship yet. |
+| Not found | ≥ 2 confirmed | `SCAM_LIKELY` | Don't ship the item unless the payment shows as Completed in your PayPal Activity. |
+| Not found otherwise, API unavailable, or no ID in the chat | any | `WAIT` | Not confirmed. Check your PayPal Activity for this payment before you ship. |
 
-"Not found" alone never means scam: Transaction Search can lag, so a real payment made minutes ago may not show yet.
+The table is applied top-down. When the chat asks the seller to send money, pay a fee or follow a payment link, the message also says: "Never send money, pay a fee or enter card details to receive a payment."
+
+"Not found" alone never means scam. PayPal gives the buyer and the seller different transaction IDs for the same payment ([PayPal Help](https://www.paypal.com/us/cshelp/article/why-are-there-different-buyer-and-seller-transaction-ids-for-the-same-transaction-ts2265)), so the ID a genuine buyer quotes is often unknown to the capture API, and Transaction Search can lag. Activity search in PayPal does find the buyer's ID.
+
+`detect_signals` looks for nine closed patterns: overpayment refund, fake payment proof, money held until tracking, third-party shipping, upfront fee, urgency, moving off-platform, unprotected payment (Friends and Family, gift cards, MB WAY requests) and payment links.
+
+Each hit carries the buyer's exact words. A hit is *confirmed* only when those words are really in the chat, compared on letters and digits only (casefold, unaccented). An unconfirmed hit still blocks `VERIFIED` but never counts toward `SCAM_LIKELY`.
 
 ## Graph 2: `dispute_defense`
 
@@ -111,7 +124,7 @@ Fields in the LangGraph state are owned by the node that writes them (an `@owns(
 |---|---|---|
 | `GET /healthz` | Built | `{"ok": true}` |
 | `POST /webhooks/paypal` | Built | `{"status": "stored"}` or `{"status": "duplicate"}`. 400 on invalid JSON or a bad signature. A 5xx if PayPal is unreachable, so PayPal retries. |
-| `POST /scam-check` | Planned | Verdict and cited reply |
+| `POST /scam-check` | Built | Body `{text, expected_amount, expected_currency}` (all required; text up to 8 000 chars after sanitising). Returns `{case_id, verdict, message, sentences, evidence, template, signals_checked, persisted}`. 422 on bad input, 503 when two checks are already running. Not authenticated yet (RECHECK #3). |
 | `POST /disputes/{id}/decision` | Planned | Approve, edit or reject a draft |
 | `GET /api/board` | Planned | Only the authenticated seller's disputes, with no buyer messages or contacts |
 
@@ -124,11 +137,14 @@ Fields in the LangGraph state are owned by the node that writes them (an `@owns(
 ## Layout
 
 ```
-app/main.py      FastAPI app, /healthz, /webhooks/paypal
-app/paypal.py    signature-header checks, OAuth token cache, verify-webhook-signature call
-app/db.py        schema bootstrap and claim_event() (idempotent insert)
-tests/           pytest + respx (PayPal is mocked, no database needed)
-render.yaml      Render blueprint: web service + free Postgres
+app/main.py         FastAPI app, /healthz, /webhooks/paypal, /scam-check
+app/paypal.py       signature-header checks, OAuth token cache, verify-webhook-signature, capture and Transaction Search lookups
+app/db.py           schema bootstrap, claim_event() (idempotent insert), save_case()
+app/scam_check.py   the scam_check graph: @owns, sanitize, the 10 nodes, verdict table, policy texts
+app/output_guardrails.py  Sentence model, validate() and render() for LLM-written sentences
+app/llm.py          the one Groq call: strict JSON schema, no tools
+tests/              pytest + respx (PayPal and Groq are mocked, no database needed)
+render.yaml         Render blueprint: web service + free Postgres
 ```
 
 ## Stack
@@ -136,7 +152,8 @@ render.yaml      Render blueprint: web service + free Postgres
 | Layer | Tool | Installed today |
 |---|---|---|
 | Core | Python 3.12, FastAPI, Uvicorn, httpx, psycopg | yes |
-| Core | LangGraph + `langgraph-checkpoint-postgres`, Pydantic v2, PyYAML, an LLM with structured output and vision | planned |
+| Core | LangGraph, Pydantic v2, Groq (`openai/gpt-oss-120b`, strict JSON-schema output) | yes |
+| Core | `langgraph-checkpoint-postgres`, PyYAML `policy_pack`, a vision model for screenshots | planned |
 | PayPal | Sandbox (US test accounts): Payments v2, Transaction Search, Disputes v1, Tracking, `verify-webhook-signature` | webhook verification only |
 | Infra | Render (web service, Postgres, cron job), cloudflared or ngrok for local webhooks | blueprint written |
 | Interface | Bryntum Scheduler (trial), Jinja2, HTMX, vanilla JS | planned |
@@ -152,8 +169,12 @@ Copy `.env.example` to `.env` (it is gitignored).
 |---|---|
 | `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` | Sandbox REST app credentials from developer.paypal.com |
 | `PAYPAL_WEBHOOK_ID` | ID of the webhook registered in PayPal. It needs a public URL. |
-| `PAYPAL_BASE_URL` | Defaults to `https://api-m.sandbox.paypal.com`. Not yet in `.env.example` or `render.yaml` (see RECHECK #5). |
-| `DATABASE_URL` | Postgres connection string. The table is created on startup. |
+| `PAYPAL_BASE_URL` | Defaults to `https://api-m.sandbox.paypal.com`. Set to `https://api-m.paypal.com` for live, in `.env` and `render.yaml`. |
+| `DATABASE_URL` | Postgres connection string. The tables are created on startup. |
+| `GROQ_API_KEY` | From console.groq.com. Required: the app does not start without it. The free tier (8K tokens/min) fits about 2 checks a minute. |
+| `LLM_MODEL` | Defaults to `openai/gpt-oss-120b`. Must be a Groq model with strict JSON-schema output. |
+
+Set `LANGSMITH_TRACING=true` only while testing with made-up chats: it sends every chat and LLM reply to LangSmith. Never set it on Render or with real cases. For `/scam-check` to find payments by ID, tick "Transaction Search" on the sandbox REST app. A new permission can take up to 9 hours to reach new tokens.
 
 ## Run locally
 
@@ -169,7 +190,8 @@ PayPal needs a public URL to deliver webhooks, so use a tunnel (cloudflared or n
 ## Tests
 
 ```sh
-pytest
+pytest              # offline: PayPal and Groq mocked
+pytest -m eval -v    # evals: the real Groq model, key from .env, made-up chats only
 ```
 
 The plan has 61 test cases in six layers, tracked by ID:
@@ -183,17 +205,28 @@ The plan has 61 test cases in six layers, tracked by ID:
 | Evaluation | E01–E05 | 60 labelled chats, 20 sandbox disputes, 30 injection variants, 50 drafts | scripts + RAGAS |
 | Spike | P01–P02 | Which payment source feeds the ledger, and whether simulator events verify | manual |
 
-**Passing today:** U11 (failed signature returns 400 and stores nothing), U12 (same event twice is stored once) and S07 (forged webhook rejected before calling PayPal). The tests mock PayPal and replace the database call, so they need neither credentials nor Postgres. They do not exercise the real SQL in `db.claim_event` (see RECHECK #7).
+**Passing today:**
+
+- Webhook: U11 (a failed signature returns 400 and stores nothing), U12 (the same event twice is stored once) and S07 (a forged webhook is rejected before PayPal is called).
+- `scam_check`:
+  - U01–U05: the verdict table.
+  - U09–U10: `@owns`.
+  - U17–U20: the output guardrails (tests/test_output_guardrails.py).
+  - Evals (`pytest -m eval`): real Groq drafts for 10 verdict paths must pass the output guardrails, and 3 injection chats run through the whole graph must not put buyer text in the reply (tests/test_eval_output_guardrails.py).
+  - N01–N04: PayPal 404, 403, 429, 503, timeouts, token failure, Transaction Search rows, LLM and database failures.
+  - S01–S06: prompt injection, unverifiable quotes, no tools and no secrets in prompts, no ship wording from the LLM, Unicode and tag tricks.
+
+The tests mock PayPal and Groq and replace the database calls, so they need neither credentials nor Postgres. They do not exercise the real SQL in `db.claim_event` or `db.save_case` (see RECHECK #7). Test IDs follow this README's grouping; there is no separate test-plan document.
 
 ## Build order
 
 | Dates | Phase | Covers |
 |---|---|---|
 | 17–24 Oct | Foundations: FastAPI, Postgres, Render deploy, sandbox OAuth, webhook verification and dedupe | P01–P02, U11–U12 |
-| 25–31 Oct | `scam_check`: nodes, verdict policy, paste UI, grounding validator | U01–U05, U09–U10, U17–U20, N01–N04, G01–G03, S01–S06 |
+| 25–31 Oct | `scam_check`: nodes, verdict policy, paste UI, output guardrails | U01–U05, U09–U10, U17–U20, N01–N04, G01–G03, S01–S06 |
 | 1–7 Nov | `dispute_defense`: fan-out, scoring, draft, `interrupt()`, approval screen, verified `policy_pack`, board | U06–U08, U13–U16, U21, N05–N10, G04–G12, S03, S07–S11 |
 | 8–12 Nov | Run the evaluation set, publish the numbers, record a real demo | E01–E05 |
 
 ## Deploy
 
-`render.yaml` defines the web service and a free Postgres. Set `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` and `PAYPAL_WEBHOOK_ID` in the Render dashboard (they are `sync: false`). Dispute creation, `require-evidence` and `adjudicate` exist only in the sandbox. Always check a dispute's HATEOAS links before calling an action.
+`render.yaml` defines the web service and a free Postgres. Set `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID` and `GROQ_API_KEY` in the Render dashboard (they are `sync: false`). Dispute creation, `require-evidence` and `adjudicate` exist only in the sandbox. Always check a dispute's HATEOAS links before calling an action.

@@ -18,3 +18,7 @@ services:
         sync: false
       - key: PAYPAL_WEBHOOK_ID
         sync: false
+      - key: PAYPAL_BASE_URL # sandbox; https://api-m.paypal.com for live
+        value: https://api-m.sandbox.paypal.com
+      - key: GROQ_API_KEY # required: the app does not start without it
+        sync: false

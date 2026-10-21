@@ -1,74 +1,46 @@
 # Recheck
 
-The 14 findings from the `/code-review` run on 2026-10-19, kept in the original order and numbering. The review read the code only. It did not run anything.
+Open findings from the `/code-review` run on 2026-10-19, with their original numbers. The review read the code only. It did not run anything. Points from #15 on came later and say where they came from.
 
-Authentication and authorization are still being built, so some of these may no longer apply once that lands. Tick a box when it is fixed. If a point turns out to be wrong or no longer relevant, write the reason next to it instead of deleting it.
+This file is a to-do list: when a point is fixed, delete it and note the fix in `CHANGES.md`. If a point turns out to be wrong or no longer relevant, write the reason next to it instead of deleting it.
 
-Line numbers are from the review date and will drift. Where I think a point depends on the auth work, I tagged it **(depends on auth)**. That tag is my guess, not the reviewer's.
-
-## Correctness
-
-- [ ] **1. Verify is sent the re-serialized event, not the raw body.** [app/paypal.py:36](app/paypal.py#L36)
-  PayPal's signature covers a CRC32 of the exact bytes it sent. `json.loads` followed by httpx's `json=` can change whitespace, escapes and float formatting, and httpx's JSON encoding has changed between releases. A genuine event can then fail verification and be dropped after retries. The tests mock PayPal, so this is never exercised.
-  *Fix:* build the request body with the raw bytes spliced in, `content=b'{...,"webhook_event":' + body + b'}'`.
-
-- [ ] **4. A PayPal 4xx on the verify call becomes a 500.** [app/paypal.py:38](app/paypal.py#L38)
-  `raise_for_status()` raises on any 4xx. A body like `{"id": NaN}` makes httpx raise `ValueError`, and a payload PayPal rejects raises `HTTPStatusError`. Forged input then produces 5xx noise and error logs.
-  *Fix:* only network errors and 5xx should raise. Map a verify 4xx to `return False` or a 400.
-
-- [ ] **8. Cached token is never dropped on 401, and refresh has no lock.** [app/paypal.py:13](app/paypal.py#L13)
-  If PayPal revokes the token before `exp`, webhooks return 500 until it expires. When the cache is empty, a burst of threads each fetches a token.
-  *Fix:* clear `_token` on 401 and retry once. Guard the refresh with a `threading.Lock`.
+Authentication and authorization are still being built, so some of these may no longer apply once that lands. Where I think a point depends on the auth work, I tagged it **(depends on auth)**. That tag is my guess, not the reviewer's.
 
 ## Config and deploy
-
-- [ ] **5. `PAYPAL_BASE_URL` is undocumented and defaults to sandbox.** [render.yaml:13](render.yaml#L13)
-  It is in neither `render.yaml` nor `.env.example`. A live deploy keeps the sandbox host, the OAuth call returns 401, and every webhook returns 500.
-  *Fix:* add it to both files, or require it explicitly instead of defaulting to sandbox.
-
-- [ ] **6. Required env vars are only read at request time.** [app/main.py:11](app/main.py#L11)
-  `lifespan` checks only the database. A missing `PAYPAL_*` value lets the service boot and pass `/healthz`, then every webhook fails with a `KeyError` 500.
-  *Fix:* check all required variables in `lifespan` before `yield`.
-
-- [ ] **11. Cert URL allowlist is hard-coded and ignores `BASE`.** [app/paypal.py:8](app/paypal.py#L8)
-  `CERT_URL` allows `api.` and `api.sandbox.` hosts, while `BASE` defaults to `api-m.`. It would reject a legitimate cert URL on another host such as `api-m.paypal.com`, and it accepts a sandbox cert URL while `BASE` is live. PayPal validates the cert itself.
-  *Fix:* derive the host from `BASE`, or drop the check.
 
 - [ ] **14. No `ipAllowList` on the free Postgres, and the free tier is not durable.** [render.yaml:1](render.yaml#L1)
   **Unverified:** the reviewer could not check this and was going from memory. Confirm against Render's docs first. Omitting `ipAllowList` may leave the database reachable from any IP, and Render's free Postgres has historically expired after about 30 days, which would delete stored events.
   *Fix:* set `ipAllowList: []` and use a paid plan for anything that must keep payment events.
+  *2026-10-21, no longer applies to Render:* commit 3f93433 removed the Render database, and `DATABASE_URL` now points to Neon. The same questions (who can connect, how long the free tier keeps data) still need checking against Neon's docs.
 
 ## Security hardening
 
-- [ ] **2. No freshness or replay check on `PAYPAL-TRANSMISSION-TIME`.** [app/paypal.py:26](app/paypal.py#L26) **(depends on auth)**
+- [ ] **2. No freshness or replay check on `PAYPAL-TRANSMISSION-TIME`.** [app/paypal.py:35](app/paypal.py#L35) **(depends on auth)**
   Captured headers can be replayed indefinitely. PayPal's integrity binding is only a CRC32 of the body, and dedupe is keyed on an `id` inside that body, so a crafted body with a new `id` could be stored as genuine. Harmless today because nothing consumes the table.
   *Fix:* reject old `transmission_time`, and re-fetch the event from PayPal's API by id before acting on it.
 
-- [ ] **3. Unauthenticated callers can trigger blocking PayPal calls.** [app/main.py:36](app/main.py#L36) **(depends on auth)**
+- [ ] **3. Unauthenticated callers can trigger blocking PayPal calls.** [app/main.py:45](app/main.py#L45) **(depends on auth)**
   There is no body-size limit, rate limit or concurrency cap, and the same 40-thread pool serves `/healthz`. A flood of plausible-looking requests can exhaust it, fail Render's health check and restart the service.
   *Fix:* cap body size, add cheap pre-checks, a concurrency limit and a rate limit.
+  *2026-10-20:* `/scam-check` adds a bigger target: each call costs 2 Groq calls and up to 6 PayPal calls. It now has a global limit of 2 concurrent checks (503 above that), and `/healthz` is `async`, so it no longer waits for a pool thread. Body size and per-caller rate limits are still open.
 
-## Performance
+## LLM output
 
-- [ ] **9. `httpx.post` builds a new client on every call.** [app/paypal.py:32](app/paypal.py#L32)
-  Each webhook pays for a fresh TLS handshake and CA-bundle load, twice when the token is stale.
-  *Fix:* one module-level `httpx.Client(timeout=...)`.
+- [ ] **15. With signals unknown, the explain step invents a warning sign.** [app/scam_check.py:296](app/scam_check.py#L296)
+  Found by the eval `verified, signals unknown` on 2026-10-21, not by the review. When `detect_signals` fails, `signals` is `None` and the verdict is `VERIFIED_WITH_WARNINGS`, but `_explain_input` never says the chat check failed. The model then cites an `E2` that does not exist ("A warning sign labeled {{E2.label}} could not be verified"). The guardrails reject it, so it is safe, but the seller gets the template instead of an explanation.
+  *Fix:* when `signals is None`, add a line such as "Chat check: could not be done" to `_explain_input`, so the model can write an `ADMIT_MISSING` sentence on `E1`. Then remove the `xfail` on that eval case.
+  *Next:* build a LangSmith dataset from the eval cases and score the explanations with an LLM-as-judge (does each sentence match the evidence and verdict?). The current evals only check the rules in `output_guardrails`, not whether the wording is true.
+
+- [ ] **16. Nobody measures whether `detect_signals` catches real scams.** [app/scam_check.py:183](app/scam_check.py#L183)
+  Added 2026-10-21, from a design discussion, not the review. The evals in `tests/test_eval_output_guardrails.py` only test the explanation. The signals never decide `VERIFIED` (PayPal does), but they decide `SCAM_LIKELY` and the warnings, and their recall and false-alarm rate are unknown.
+  *Fix:* an opt-in eval (`pytest -m eval`) with 30–40 made-up but realistic chats in PT and EN: OLX/Vinted scams, MB WAY, "paguei a mais", own courier, fake PayPal emails, plus honest buyers. Check the expected signal types and `confirmed` per chat, and report recall and false alarms per signal. A second LLM reviewing the first is not the fix: it reads the same buyer text, so the same injection fools both.
+
+- [ ] **17. Consider Jev (TypeSafe AI) for `detect_signals`.**
+  Added 2026-10-21, an idea, not a finding. Jev does not generate text: it takes a state and typed questions (yes/no, rubric, multiple choice) and returns probabilities. That matches `detect_signals` (one yes/no per signal type) and would give a tunable threshold instead of a quote or null. It can also act as the judge for #15 *Next*. It is reachable from Pydantic AI (`typesafe:jev-latest`), DeepEval and Promptfoo.
+  *Before deciding:* run it on the #16 eval and compare it with the current Groq model. Check pricing and data handling in TypeSafe's own docs, because buyer chats would be sent to a new vendor. Pin a version (`jev-1.13.0`-style) if a threshold is tuned. It returns no quote, so the `confirmed` check that stops invented quotes would need a replacement.
 
 ## Tests
 
-- [ ] **7. Tests don't cover the real SQL or the PayPal request.** [tests/test_webhook.py:64](tests/test_webhook.py#L64)
-  `test_u12` uses a hand-written fake `claim`, so a bug in `ON CONFLICT DO NOTHING`, the `rowcount == 1` check or the schema would pass. The PayPal mock accepts any body, so a wrong field name, a missing `webhook_id` or a re-serialized event goes unnoticed. Also untested: invalid JSON, PayPal 4xx/5xx, token failure, token caching and expiry, and `/healthz`.
-  *Fix:* add a real-Postgres test or a fake connection, and assert the verify request payload.
-
-## Housekeeping
-
-- [ ] **10. Dependencies are unpinned.** [requirements.txt:1](requirements.txt#L1)
-  A redeploy can pick up a new httpx, which changes the bytes sent to PayPal (see #1), or break the test suite. The test run today already prints a Starlette warning that `httpx` with `TestClient` is deprecated in favor of `httpx2`.
-  *Fix:* pin versions or use a lock file.
-
-- [ ] **12. `app/` has no `__init__.py`.** [app/main.py:7](app/main.py#L7)
-  It works as an implicit namespace package, but any regular `app` package elsewhere on `sys.path` would shadow it.
-  *Fix:* add an empty `app/__init__.py`.
-
-- [ ] **13. Needless header-map copy.** [app/paypal.py:28](app/paypal.py#L28)
-  `{k.upper(): v ...}` rebuilds the dict on every request. Starlette's `Headers` is already case-insensitive, so `headers.get('paypal-auth-algo')` does the same job.
+- [ ] **7. Tests don't cover the real SQL.** [tests/test_webhook.py:50](tests/test_webhook.py#L50)
+  `test_u12` uses a hand-written fake `claim`, so a bug in `ON CONFLICT DO NOTHING`, the `rowcount == 1` check or the schema would pass. The same goes for `claim_payment` and `save_case`.
+  *Fix:* add a real-Postgres test, skipped when no database is reachable.
