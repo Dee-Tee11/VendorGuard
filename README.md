@@ -2,21 +2,23 @@
 
 Built for the PayPal AI Hackathon (deadline 12 Nov 2026, 20:00 Lisbon, PayPal Sandbox only).
 
-Two [LangGraph](https://langchain-ai.github.io/langgraph/) graphs on FastAPI, deployed on Render, that protect a PayPal seller:
+[LangGraph](https://langchain-ai.github.io/langgraph/) graphs on FastAPI, deployed on Render, that protect a PayPal seller:
 
 1. **`scam_check`: before shipping.** The seller pastes a buyer's chat, email or screenshot. Vendor Guard checks the claimed payment against PayPal and returns a verdict: ship, wait, or don't ship.
 2. **`dispute_defense`: after shipping.** A `CUSTOMER.DISPUTE.CREATED` webhook starts a graph that gathers evidence, drafts a response and **stops for the seller's approval** before anything is sent to PayPal.
+3. **`chat`: the way in.** The seller writes in plain language (LangGraph Studio's Chat tab today, the UI later). The chat answers from checked notes, runs `scam_check`, or explains disputes.
 
 PayPal is the source of truth in both graphs, and nothing that moves money happens without the seller approving it.
 
-> **Status: week 2 of 4 (`scam_check`).** Webhook intake works end to end. The `scam_check` graph and `POST /scam-check` are built and tested, with PayPal and the LLM mocked. Seller authentication and authorization are in progress. `dispute_defense` and the board UI are still to build. See [CHANGES.md](CHANGES.md) for what is done and [RECHECK.md](RECHECK.md) for open code-review points.
+> **Status: week 2 of 4 (`scam_check`).** Webhook intake works end to end. The `scam_check` graph and `POST /scam-check` are built and tested, with PayPal and the LLM mocked. They take pasted text, a screenshot, or both. Seller authentication and authorization are in progress. `dispute_defense` and the board UI are still to build. See [CHANGES.md](CHANGES.md) for what is done and [RECHECK.md](RECHECK.md) for open code-review points.
 
 | Area | Status |
 |---|---|
 | Webhook intake: signature check and dedupe (`/webhooks/paypal`) | Done (tests U11, U12, S07) |
 | Postgres storage, Render blueprint | Done (`render.yaml` written) |
 | Seller authentication, single-use approval tokens | In progress |
-| `scam_check` graph and `POST /scam-check` | Done (U01–U05, U09–U10, U17–U20, N01–N04, S01–S06). Paste page and screenshots planned |
+| `scam_check` graph and `POST /scam-check` | Done, screenshots included (U01–U05, U09–U10, U17–U20, N01–N04, S01–S06). Paste page planned |
+| `chat` graph and `policy_pack` | Done in Studio (C01–C16, U16, E06). No API endpoint yet; the PayPal notes wait for a person to verify them |
 | `dispute_defense` graph, approval screen, Bryntum board | Planned, 1–7 Nov |
 | Evaluation set, published numbers, demo video | Planned, 8–12 Nov |
 
@@ -38,7 +40,7 @@ Seller UI ──► FastAPI (Render) ──► LangGraph ──► PayPal REST A
 
 ```mermaid
 flowchart TD
-  A[ingest_input] --> B[sanitize_untrusted]
+  A[ingest_input] --> R[read_screenshot] --> B[sanitize_untrusted]
   B --> C[detect_signals]
   B --> D[extract_claims] --> E[verify_payment]
   C --> F[compute_verdict]
@@ -47,6 +49,10 @@ flowchart TD
   H -- ok --> I[persist_case]
   H -- fail --> J[safe_template] --> I
 ```
+
+`read_screenshot` runs only when the seller sends an image. A Groq vision model (`qwen/qwen3.8-27b`) copies its text and labels chat bubbles `Buyer:` (left) or `Seller:` (right). It writes `[?]` for words it can't read instead of guessing them. The copy is untrusted buyer text. It is joined to any pasted text and sanitised like a paste, so every later node works as before. If the copy fails, there is no verdict and no case: the API answers 422 and asks for another try or the pasted text.
+
+A copy can still be wrong, so the quote check confirms a quote against the copy, not against the image. That cannot approve a payment, because PayPal still has to find the ID. A misread ID gives `WAIT`. The worst cases are a false warning, or a missed warning on a real payment, where the address rule is shown anyway.
 
 `extract_claims` takes up to three 17-character transaction IDs from the chat, using a regex and no LLM. `verify_payment` tries each one against the capture API (`GET /v2/payments/captures/{id}`), then Transaction Search (which can lag by hours).
 
@@ -96,11 +102,89 @@ flowchart TD
 - `score_evidence` for INR (0–100): verifiable delivered tracking 40, address matches the transaction details page 25, tracking linked to the transaction 15, shipped before the dispute 10, conversation saved 10. At 70 or above it recommends contesting. For SNAD it marks `seller_protection=false`.
 - `human_approval` uses `interrupt()` and issues a single-use approval token bound to the draft's hash. `execute_action` checks the token and the dispute's HATEOAS link, then calls `provide-evidence`, `make-offer` or `accept-claim` with a `PayPal-Request-Id` so a retry never double-sends.
 
+## Graph 3: `chat`
+
+```mermaid
+flowchart TD
+  M[seller message] --> R{route_in: no LLM}
+  R -- waiting for the price or the chat --> K[check]
+  R -- "check", or looks like a pasted chat --> S[start_check]
+  R -- otherwise --> C[classify: LLM]
+  C -- question --> Q[question]
+  C -- scam_check --> S
+  C -- dispute --> D[dispute]
+  C -- other --> O[other]
+```
+
+One Groq call per message, `classify`, picks closed choices only: an intent (`question`, `scam_check`, `dispute` or `other`) and up to 3 keys of verified `policy_pack` notes.
+
+- **What it sees:** only the current message, sanitised and inside `<question>` tags, and the titles of the verified notes.
+- **What it never sees:** earlier messages, the buyer's chat, a check's result or search results.
+- **What it can't do:** it has no tools, writes no text the seller reads and stores no memories.
+
+Every reply is written in `app/chat.py`, by `scam_check`, or comes from PayPal (a page title and its link). The replies are in English.
+
+- **question:**
+  - Verified notes are shown word for word, with their source.
+  - If no note fits, Tavily searches PayPal's US pages, and the chat lists up to 3 titles and links that start with `https://www.paypal.com/us/` (filtered in code).
+  - If the search finds nothing, fails, or there is no key, the reply is "I don't have that information" and PayPal's US business help link.
+- **scam_check:**
+  - The code asks for the price ("25.00 USD"), reads it with a regex and validates it like `POST /scam-check`. Then it asks for the buyer's chat.
+  - That next message goes to `scam_check.run()` exactly as typed, with no classification and no search. "cancel" stops at either step.
+  - The reply is the verdict, the message and the sentences, never the evidence, which holds the buyer's quotes.
+  - Screenshots are not supported here yet.
+- **dispute:** fixed text, plus the verified dispute notes. Once `dispute_defense` exists, this is where the chat will ask for the dispute ID.
+- **other:** what Vendor Guard does, the titles of the verified notes, and how to start a check.
+
+Things that are easy to get wrong:
+
+- **Pasted chats.** A message with a 17-character ID, `Buyer:`/`Seller:` lines or more than 400 characters starts a check instead of being classified, so it reaches neither the LLM nor Tavily. A short buyer line with neither can't be told apart from a question.
+- **Isolated check.** `scam_check.run()` runs in an empty `contextvars.Context()`. Called directly inside a node, LangGraph treats it as a subgraph: it would save `scam_check`'s state, quotes included, in the chat thread's checkpoints and stream it to Studio.
+- **Input.** The graph's input is `messages` only, so a client can't set the price or the intent. The router on `START` still reads the raw input: a crafted `awaiting` reaches `check`, which then asks for the price.
+- **One request.** `classify` makes a single request (`llm.ask(..., attempts=1)`). On any failure the seller gets the introduction and nothing is searched. The message with the buyer's chat makes no `classify` call; `scam_check.run()` makes its usual two.
+- **Prompt detail.** Without "Reply with the JSON object only." at the end of the prompt, `gpt-oss-120b` sometimes wrote its reasoning as the answer, and Groq returned a 400 (`output_parse_failed`). That happened in 5 of 8 tries on one message.
+- **No API yet.** The chat has no endpoint. When it gets one, a message that runs a check must take the same `SCAM_LIMIT` slot as `POST /scam-check`.
+
+### Tavily
+
+`TAVILY_API_KEY` is optional. The call is `POST https://api.tavily.com/search` with httpx:
+
+- a 5 s timeout and no retry; any error gives the help link;
+- `search_depth: basic`, which costs 1 credit (the free plan has 1 000 a month);
+- `include_domains: ["www.paypal.com"]`;
+- no LLM answer and no page text.
+
+The query is only the seller's current message, after this cleanup:
+
+- sanitised;
+- without self-introductions ("I'm Amanda"), emails, links, phone numbers or 17-character IDs;
+- cut to 400 characters.
+
+Other names stay in the query (RECHECK #20).
+
+What Tavily does with queries, according to its own pages:
+
+- The [Privacy Policy](https://tavily.com/privacy) (24 Nov 2025) says Tavily:
+  - keeps query data "for the period necessary to provide and improve the Services";
+  - may use parts of it to improve future responses;
+  - may share it with third-party search index providers such as Google;
+  - asks users not to put personal information in queries.
+- The [Platform Terms](https://www.tavily.com/terms) (4 May 2026, §9.2) give Tavily a perpetual, irrevocable licence over queries.
+- No DPA is published, and zero data retention is not in the standard terms.
+- **Turn off "Allow Use of Query Data"** in the Tavily account settings: it stops queries from being stored or used for improvements.
+- Tavily is a US company (AlphaAI Technologies Inc., New York). Nebius announced an agreement to acquire it on 10 Feb 2026.
+
+The app starts without the key, unlike `GROQ_API_KEY`:
+
+- Without Groq, every check silently loses signal detection and the explanation, and every chat message fails.
+- Without Tavily, only a question with no note loses the search, and its answer is the same honest "I don't have that information" that a Tavily outage gives.
+- Refusing to start would take down the webhook and `/scam-check` for an optional feature. `app/chat.py` logs a warning when the key is missing.
+
 ## How hallucinations are prevented
 
 The LLM chooses the words and the code supplies the facts.
 
-1. **Closed context.** Each call sees only this case's evidence and the one `policy_pack` entry chosen by `load_policy`. No web search, no other cases.
+1. **Closed context.** Each call sees only this case's evidence and the one `policy_pack` entry chosen by `load_policy`. No web text reaches the LLM, and no other cases.
 2. **Sentences with sources.** Output is a list of `Sentence` (closed `intent`, at least one source: `E…` for evidence, `P.…` for policy).
 3. **Facts by placeholder.** The model writes `{{E2.delivered_at}}`, never a date. The code fills in the real value, and policy text is inserted verbatim by `policy_id`.
 4. **Deterministic validation.** Every source must exist, every placeholder must belong to a cited source, and no numbers, dates, emails, URLs or phone numbers may appear outside placeholders. Banned phrases ("guaranteed", "you will win", legal or tax advice, other platforms) are rejected.
@@ -109,7 +193,15 @@ The LLM chooses the words and the code supplies the facts.
 
 Fields in the LangGraph state are owned by the node that writes them (an `@owns(...)` decorator), so an LLM node cannot write the verdict.
 
-`policy_pack.yaml` holds one entry per PayPal rule, looked up by key and never by similarity. Each entry needs `source_url`, `retrieved_at` and `verified: true` before it is used (CI fails otherwise, test U16). Seller Protection depends on region, and for the demo it assumes a US sandbox business account. It does not cover "Significantly Not as Described", so the agent never promises protection on a SNAD dispute.
+`app/policy_pack.py` is a Python dict of notes, looked up by key and never by similarity.
+
+- Each entry has `title`, `text`, `source_url`, `retrieved_at` and `verified`.
+- An entry is shown, or offered to the LLM, only once a person has read its source page and set `verified: True` (test U16).
+- There are two kinds of entry:
+  - **Vendor Guard notes:** the verdicts, why WAIT, how to ask for a check. They are built from `scam_check`'s own texts and are verified.
+  - **PayPal notes:** 17 of them, each from one `https://www.paypal.com/us/` page, with the page's sentences word for word. The only edit is "we" → "PayPal". All are verified (2026-10-22). Two quote only part of a list of requirements (`pp_seller_protection`, `pp_proof_of_delivery`), so they end with a sentence of Vendor Guard's own: "This is not PayPal's full list", with the page's link.
+- The region is set once, in `REGION`.
+- No PayPal US page says refunds must go only through PayPal, so the refund note says only how to refund in PayPal. Response deadlines are given only where a US Help Center page states them (10 days for a dispute). Seller Protection depends on region, and for the demo it assumes a US sandbox business account. It does not cover "Significantly Not as Described", so the agent never promises protection on a SNAD dispute.
 
 ## Interface (planned)
 
@@ -124,7 +216,7 @@ Fields in the LangGraph state are owned by the node that writes them (an `@owns(
 |---|---|---|
 | `GET /healthz` | Built | `{"ok": true}` |
 | `POST /webhooks/paypal` | Built | `{"status": "stored"}` or `{"status": "duplicate"}`. 400 on invalid JSON or a bad signature. A 5xx if PayPal is unreachable, so PayPal retries. |
-| `POST /scam-check` | Built | Body `{text, expected_amount, expected_currency}` (all required; text up to 8 000 chars after sanitising). Returns `{case_id, verdict, message, sentences, evidence, template, signals_checked, persisted}`. 422 on bad input, 503 when two checks are already running. Not authenticated yet (RECHECK #3). |
+| `POST /scam-check` | Built | Body `{text, image, expected_amount, expected_currency}`. Send `text`, `image` or both. `image` is a base64 PNG or JPEG with no `data:` prefix, up to 3 MB. The chat may be up to 8 000 chars after sanitising, counting the screenshot's text. Returns `{case_id, verdict, message, sentences, evidence, template, signals_checked, persisted}`, never the chat or the screenshot's text. 422 on bad input or a screenshot that can't be read, 503 when two checks are already running. Not authenticated yet (RECHECK #3). |
 | `POST /disputes/{id}/decision` | Planned | Approve, edit or reject a draft |
 | `GET /api/board` | Planned | Only the authenticated seller's disputes, with no buyer messages or contacts |
 
@@ -141,9 +233,12 @@ app/main.py         FastAPI app, /healthz, /webhooks/paypal, /scam-check
 app/paypal.py       signature-header checks, OAuth token cache, verify-webhook-signature, capture and Transaction Search lookups
 app/db.py           schema bootstrap, claim_event() (idempotent insert), save_case()
 app/scam_check.py   the scam_check graph: @owns, sanitize, the 10 nodes, verdict table, policy texts
+app/chat.py         the chat graph: route_in, classify, the check flow, the Tavily search
+app/policy_pack.py  the notes the chat shows: Vendor Guard's and PayPal's, with sources and `verified`
 app/output_guardrails.py  Sentence model, validate() and render() for LLM-written sentences
-app/llm.py          the one Groq call: strict JSON schema, no tools
+app/llm.py          the Groq calls, no tools: ask() with a strict JSON schema, read_image() for screenshots
 tests/              pytest + respx (PayPal and Groq are mocked, no database needed)
+langgraph.json      serves the scam_check and chat graphs to `langgraph dev` and LangGraph Studio
 render.yaml         Render blueprint: web service + free Postgres
 ```
 
@@ -152,12 +247,13 @@ render.yaml         Render blueprint: web service + free Postgres
 | Layer | Tool | Installed today |
 |---|---|---|
 | Core | Python 3.12, FastAPI, Uvicorn, httpx, psycopg | yes |
-| Core | LangGraph, Pydantic v2, Groq (`openai/gpt-oss-120b`, strict JSON-schema output) | yes |
-| Core | `langgraph-checkpoint-postgres`, PyYAML `policy_pack`, a vision model for screenshots | planned |
+| Core | LangGraph, Pydantic v2, Groq (`openai/gpt-oss-120b`, strict JSON-schema output; `qwen/qwen3.8-27b` reads screenshots, a preview model) | yes |
+| Core | `langgraph-checkpoint-postgres` | planned |
+| Search | Tavily Search API through httpx, no SDK (`chat` only) | yes, optional |
 | PayPal | Sandbox (US test accounts): Payments v2, Transaction Search, Disputes v1, Tracking, `verify-webhook-signature` | webhook verification only |
 | Infra | Render (web service, Postgres, cron job), cloudflared or ngrok for local webhooks | blueprint written |
 | Interface | Bryntum Scheduler (trial), Jinja2, HTMX, vanilla JS | planned |
-| Tests | pytest, respx; pytest-asyncio, RAGAS and promptfoo later | pytest, respx |
+| Tests | pytest, respx, Pillow (draws the eval screenshots); pytest-asyncio, RAGAS and promptfoo later | pytest, respx, Pillow |
 | DevSecOps | GitHub Actions, Bandit or Semgrep, pip-audit | planned |
 | Observability | Langfuse or LangSmith (optional) | planned |
 
@@ -173,6 +269,8 @@ Copy `.env.example` to `.env` (it is gitignored).
 | `DATABASE_URL` | Postgres connection string. The tables are created on startup. |
 | `GROQ_API_KEY` | From console.groq.com. Required: the app does not start without it. The free tier (8K tokens/min) fits about 2 checks a minute. |
 | `LLM_MODEL` | Defaults to `openai/gpt-oss-120b`. Must be a Groq model with strict JSON-schema output. |
+| `TAVILY_API_KEY` | From app.tavily.com. Optional: without it the app starts, and a chat question with no note gets PayPal's help link. Turn off "Allow Use of Query Data" in the Tavily account (see Graph 3). |
+| `VISION_MODEL` | Defaults to `qwen/qwen3.8-27b`, which reads screenshots. Must be a Groq model with image input that accepts `reasoning_effort="none"`. It is a preview model and can be withdrawn at short notice. A screenshot costs about 2 000 tokens of its own per-minute limit, separate from `LLM_MODEL`'s. |
 
 Set `LANGSMITH_TRACING=true` only while testing with made-up chats: it sends every chat and LLM reply to LangSmith. Never set it on Render or with real cases. For `/scam-check` to find payments by ID, tick "Transaction Search" on the sandbox REST app. A new permission can take up to 9 hours to reach new tokens.
 
@@ -187,6 +285,40 @@ uvicorn app.main:app --reload --env-file .env
 
 PayPal needs a public URL to deliver webhooks, so use a tunnel (cloudflared or ngrok) and register `https://<tunnel>/webhooks/paypal` in the PayPal dashboard. Events from the webhook simulator do not pass signature verification, so test with real sandbox payments.
 
+### Try `scam_check` in LangGraph Studio
+
+```sh
+langgraph dev --studio-url https://eu.smith.langchain.com   # the LangSmith account is in the EU region
+```
+
+This opens Studio on the `scam_check` graph (log in to LangSmith). Paste this into the input, in JSON mode:
+
+```json
+{"text": "Buyer: Já paguei, o ID é 3Y662965014333303", "expected_amount": "25.00", "expected_currency": "EUR"}
+```
+
+Studio shows each node's state, and you can pause before any node. The things to know:
+
+- Studio runs the graph directly, so the `/scam-check` validation and the limit of 2 checks at a time do not apply.
+- Screenshots can't be tried here: `image` is bytes and Studio sends JSON. Use `POST /scam-check` or `pytest -m eval`.
+- `verify_payment` and `persist_case` need Postgres with its tables, which are created when `uvicorn` first starts. Without them, a real payment gives `WAIT` ("not confirmed").
+- An ID that already approved a case gives `P.WAIT_REUSED` the next time. To try it again, run `psql "$DATABASE_URL" -c "TRUNCATE claimed_payments"`.
+- Groq and PayPal Sandbox are called for real. With `LANGSMITH_TRACING=true` every run is traced, so use made-up chats only.
+
+### Try `chat` in LangGraph Studio
+
+Pick the `chat` graph and switch to Chat mode. Each message is one run on the thread. Try:
+
+1. "Hi, I am Amanda and I have a few questions regarding a possible scam, can you help me?"
+2. "What does WAIT mean?"
+3. "check", then "25.00 USD", then a made-up chat.
+4. "check", then "cancel".
+5. "I got a dispute".
+
+- The buyer's chat you paste stays in the thread's history, saved in `.langgraph_api/`. Deleting the thread in `langgraph dev` leaves the messages on disk. To wipe them, stop the server and delete `.langgraph_api/` (RECHECK #19).
+- Text attachments (.txt, .md, .json) arrive as text, so a chat export works. Images get "I can only read text here for now".
+- The 2-checks-at-a-time limit doesn't apply in Studio, as with `scam_check`.
+
 ## Tests
 
 ```sh
@@ -194,7 +326,7 @@ pytest              # offline: PayPal and Groq mocked
 pytest -m eval -v    # evals: the real Groq model, key from .env, made-up chats only
 ```
 
-The plan has 61 test cases in six layers, tracked by ID:
+The plan has 61 test cases in six layers, plus C01–C16 for the chat, tracked by ID:
 
 | Layer | IDs | What it covers | Where it runs |
 |---|---|---|---|
@@ -202,6 +334,7 @@ The plan has 61 test cases in six layers, tracked by ID:
 | Node (mock) | N01–N10 | LLM and API nodes against simulated PayPal errors (429, 503, `ERRDIS…`) | CI |
 | Sandbox | G01–G12 | End to end on PayPal Sandbox, including resume after restart | manual scripts |
 | Security | S01–S11 | Prompt injection, forged webhooks, token replay, no tools on LLM nodes | pytest + promptfoo |
+| Chat | C01–C16 | `app/chat.py`: routing, the check flow, Tavily, links, personal data | CI, Groq and Tavily mocked |
 | Evaluation | E01–E05 | 60 labelled chats, 20 sandbox disputes, 30 injection variants, 50 drafts | scripts + RAGAS |
 | Spike | P01–P02 | Which payment source feeds the ledger, and whether simulator events verify | manual |
 
@@ -213,8 +346,16 @@ The plan has 61 test cases in six layers, tracked by ID:
   - U09–U10: `@owns`.
   - U17–U20: the output guardrails (tests/test_output_guardrails.py).
   - Evals (`pytest -m eval`): real Groq drafts for 10 verdict paths must pass the output guardrails, and 3 injection chats run through the whole graph must not put buyer text in the reply (tests/test_eval_output_guardrails.py).
+  - Screenshot evals (tests/test_eval_screenshot.py): drawn PT and EN chats, one with an injection, must be copied word for word with the ID and the right `Buyer:`/`Seller:` labels. A blurred chat must not be guessed, and a screenshot alone run through the whole graph must give `SCAM_LIKELY`.
+  - Screenshots, offline: a screenshot alone, a screenshot plus text, bad uploads, a failed copy (no verdict, no case, PayPal not called), and no tools or secrets in the vision call (S03).
   - N01–N04: PayPal 404, 403, 429, 503, timeouts, token failure, Transaction Search rows, LLM and database failures.
   - S01–S06: prompt injection, unverifiable quotes, no tools and no secrets in prompts, no ship wording from the LLM, Unicode and tag tricks.
+- `chat` (tests/test_chat.py):
+  - C01–C16: every intent, the price and the chat flow, and cancel.
+  - The buyer's chat never reaches the chat's LLM or Tavily, and no quotes appear in the reply or in the thread.
+  - Pasted chats, the tag injection, the link filter, Tavily failures, personal data in the search, one Groq request per message, no tools or secrets.
+  - U16: the `policy_pack` sources, and that unverified notes are never offered or shown.
+  - E06 (tests/test_eval_chat.py, `pytest -m eval -s`): 10 messages, the real Groq model, 10 of 10. Each call uses about 450–620 tokens.
 
 The tests mock PayPal and Groq and replace the database calls, so they need neither credentials nor Postgres. They do not exercise the real SQL in `db.claim_event` or `db.save_case` (see RECHECK #7). Test IDs follow this README's grouping; there is no separate test-plan document.
 
@@ -229,4 +370,4 @@ The tests mock PayPal and Groq and replace the database calls, so they need neit
 
 ## Deploy
 
-`render.yaml` defines the web service and a free Postgres. Set `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID` and `GROQ_API_KEY` in the Render dashboard (they are `sync: false`). Dispute creation, `require-evidence` and `adjudicate` exist only in the sandbox. Always check a dispute's HATEOAS links before calling an action.
+`render.yaml` defines the web service and a free Postgres. Set `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`, `GROQ_API_KEY` and, optionally, `TAVILY_API_KEY` in the Render dashboard (they are `sync: false`). Dispute creation, `require-evidence` and `adjudicate` exist only in the sandbox. Always check a dispute's HATEOAS links before calling an action.

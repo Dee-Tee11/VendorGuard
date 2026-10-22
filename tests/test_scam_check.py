@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import subprocess
@@ -31,6 +32,8 @@ SCAM_CHAT = PAID + " Preciso que envie hoje sem falta! Fala comigo no WhatsApp."
 TWO_SIGNALS = {"urgency_pressure": "Preciso que envie hoje sem falta", "off_platform": "Fala comigo no WhatsApp"}
 GOOD_DRAFT = [Sentence(intent="EXPLAIN_PAYMENT", text="PayPal reports this payment as {{E1.status}}.", sources=["E1"])]
 GROQ = "https://api.groq.com/openai/v1/chat/completions"
+PNG = b"\x89PNG\r\n\x1a\n" + bytes(8)  # the app checks only the first bytes; the vision call is mocked
+JPEG = b"\xff\xd8\xff\xe0" + bytes(8)
 client = TestClient(main.app)  # no `with`: skips lifespan, so no DB needed
 
 
@@ -55,8 +58,9 @@ def claimed(monkeypatch):
 
 @pytest.fixture
 def llm_stub(monkeypatch):
-    """Replaces the Groq call: `signals` is the quote per pattern, `draft` the sentences; an exception is raised."""
-    stub = SimpleNamespace(signals={}, draft=GOOD_DRAFT)
+    """Replaces the Groq calls: `signals` is the quote per pattern, `draft` the sentences, `transcript` the
+    screenshot's text; an exception is raised."""
+    stub = SimpleNamespace(signals={}, draft=GOOD_DRAFT, transcript="")
 
     def ask(schema, system, user):
         answer = stub.signals if schema is scam_check.SignalsOut else stub.draft
@@ -66,7 +70,13 @@ def llm_stub(monkeypatch):
             return schema(**{k.lower(): None for k in scam_check.SIGNALS} | answer)
         return schema(sentences=answer)
 
+    def read_image(prompt, image):
+        if isinstance(stub.transcript, Exception):
+            raise stub.transcript
+        return stub.transcript
+
     monkeypatch.setattr(llm, "ask", ask)
+    monkeypatch.setattr(llm, "read_image", read_image)
     return stub
 
 
@@ -139,6 +149,7 @@ def test_u10_only_compute_verdict_decides():
     assert all(hasattr(fn, "owns") for fn in nodes.values())
     for field in ("verdict", "policy_id", "evidence"):
         assert [n for n, fn in nodes.items() if field in fn.owns] == ["compute_verdict"]
+    assert nodes["read_screenshot"].owns == {"transcript"}
     assert nodes["detect_signals"].owns == {"signals"}
     assert nodes["explain_and_reply"].owns == {"draft"}
 
@@ -354,13 +365,17 @@ def completion(content, finish="stop"):
     })
 
 
-def test_s03_prompts_hold_no_tools_no_secrets_and_explain_sees_no_buyer_text(api, saved):
+@pytest.mark.parametrize("screenshot", [False, True], ids=["pasted", "screenshot"])
+def test_s03_prompts_hold_no_tools_no_secrets_and_explain_sees_no_buyer_text(api, saved, screenshot):
     capture(api, httpx.Response(200, json=COMPLETED))
     canary = "CANARY-BUYER-LINE"
+    chat = PAID + f" {canary} hurry up please"
 
     def reply(request):
         body = json.loads(request.content)
         assert "tools" not in body and "tool_choice" not in body
+        if body["model"] == llm.VISION_MODEL:
+            return completion(f"Buyer: {chat}")
         if body["response_format"]["json_schema"]["name"] == "SignalsOut":
             quotes = {k.lower(): None for k in scam_check.SIGNALS} | {"urgency_pressure": f"{canary} hurry up please"}
             return completion(json.dumps(quotes))
@@ -368,16 +383,30 @@ def test_s03_prompts_hold_no_tools_no_secrets_and_explain_sees_no_buyer_text(api
         return completion(json.dumps({"sentences": [sentence]}))
 
     groq = api.post(GROQ).mock(side_effect=reply)
-    out = run(PAID + f" {canary} hurry up please")
+    out = scam_check.run("", "25.00", "EUR", PNG) if screenshot else run(chat)
     assert out["verdict"] == "VERIFIED_WITH_WARNINGS" and out["signals_checked"] and not out["template"]
+    assert out["evidence"]["E2"]["confirmed"] == "yes"
     prompts = {}
     for call in groq.calls:
         body = json.loads(call.request.content)
-        prompts[body["response_format"]["json_schema"]["name"]] = json.dumps(body["messages"])
+        name = body["response_format"]["json_schema"]["name"] if "response_format" in body else "vision"
+        prompts[name] = json.dumps(body["messages"])
     for text in prompts.values():
         for secret in ("A21AA-CANARY", "CANARY-PP-SECRET", "gsk_CANARY"):  # bearer token (conftest), app secrets
             assert secret not in text
     assert canary in prompts["SignalsOut"] and canary not in prompts["Draft"]
+    assert ("vision" in prompts) is screenshot
+    if screenshot:  # the type comes from the file's bytes
+        assert f"data:image/png;base64,{base64.b64encode(PNG).decode()}" in prompts["vision"]
+
+
+def test_s03_read_image_rejects_cut_off_copies_and_non_images(api):
+    groq = api.post(GROQ).mock(return_value=completion("Buyer: Já paguei", finish="length"))
+    with pytest.raises(RuntimeError):
+        llm.read_image("prompt", PNG)
+    with pytest.raises(ValueError):
+        llm.read_image("prompt", b"GIF89a")
+    assert groq.call_count == 1
 
 
 def test_s03_ask_retries_bad_json_once(api):
@@ -425,6 +454,64 @@ def test_api_returns_only_the_result(api, llm_stub, saved):
     assert set(r.json()) == {"case_id", "verdict", "message", "sentences", "evidence", "template",
                              "signals_checked", "persisted"}
     assert r.json()["verdict"] == "VERIFIED" and r.json()["persisted"] is True
+
+
+def b64(data):
+    return base64.b64encode(data).decode()
+
+
+@pytest.mark.parametrize("image", [PNG, JPEG], ids=["png", "jpeg"])
+def test_api_checks_a_screenshot_alone_and_never_returns_its_text(api, llm_stub, saved, image):
+    capture(api, httpx.Response(200, json=COMPLETED))
+    llm_stub.transcript = f"Buyer: {PAID}"
+    r = client.post("/scam-check", json=BODY | {"image": b64(image)})
+    assert r.status_code == 200 and r.json()["verdict"] == "VERIFIED"
+    assert "paguei" not in json.dumps(r.json()) and "paguei" not in json.dumps(saved)
+
+
+def test_screenshot_and_pasted_text_are_one_chat(api, llm_stub, saved):
+    """The id is only in the paste and the warning signs only in the screenshot: both count."""
+    capture(api, httpx.Response(404))
+    search(api)
+    llm_stub.transcript = "Buyer: Preciso que envie hoje sem falta!\nBuyer: Fala comigo no WhatsApp."
+    llm_stub.signals = TWO_SIGNALS
+    assert scam_check.run(PAID, "25.00", "EUR", PNG)["verdict"] == "SCAM_LIKELY"
+
+
+@pytest.mark.parametrize("extra", [
+    pytest.param({}, id="neither text nor screenshot"),
+    pytest.param({"text": ""}, id="empty text"),
+    pytest.param({"image": b64(b"%PDF-1.7 not an image")}, id="a pdf"),
+    pytest.param({"image": "data:image/png;base64," + b64(PNG)}, id="a data url"),
+    pytest.param({"image": b64(PNG + bytes(3_000_000))}, id="over 3 MB"),
+    pytest.param({"image": b64(PNG).replace("+", "-").replace("/", "_") + "-_"}, id="url-safe base64"),
+])
+def test_api_rejects_a_bad_screenshot_request(extra):
+    r = client.post("/scam-check", json=BODY | extra)
+    assert r.status_code == 422 and isinstance(r.json()["detail"], list)  # a validation error: the graph never ran
+
+
+def test_api_says_a_data_url_is_not_plain_base64():
+    r = client.post("/scam-check", json=BODY | {"image": "data:image/png;base64," + b64(PNG)})
+    assert "no data: prefix" in r.json()["detail"][0]["msg"]
+
+
+def test_api_checks_the_size_before_decoding(monkeypatch):
+    monkeypatch.setattr(base64, "b64decode", lambda *a, **k: pytest.fail("decoded an oversized image"))
+    assert client.post("/scam-check", json=BODY | {"image": "A" * 4_000_004}).status_code == 422
+
+
+@pytest.mark.parametrize("transcript, detail", [
+    pytest.param(RuntimeError("groq down"), "could not read the screenshot, try again or paste the chat as text",
+                 id="vision call failed"),
+    pytest.param("x" * scam_check.MAX_CHARS, "chat too long", id="too much text with the paste"),
+])
+def test_api_an_unreadable_screenshot_gives_no_verdict(api, llm_stub, saved, transcript, detail):
+    llm_stub.transcript = transcript
+    r = client.post("/scam-check", json=BODY | {"text": PAID, "image": b64(PNG)})
+    assert (r.status_code, r.json()["detail"]) == (422, detail)
+    assert not saved and not api.calls  # no case stored, PayPal never asked
+    assert main.SCAM_LIMIT.borrowed_tokens == 0  # the slot is given back
 
 
 @pytest.mark.parametrize("missing", ["expected_amount", "expected_currency"])

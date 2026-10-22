@@ -1,0 +1,5 @@
+{
+  "dependencies": ["."],
+  "graphs": {"scam_check": "./app/scam_check.py:graph", "chat": "./app/chat.py:graph"},
+  "env": ".env"
+}

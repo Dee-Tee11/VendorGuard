@@ -23,6 +23,12 @@ Authentication and authorization are still being built, so some of these may no 
   There is no body-size limit, rate limit or concurrency cap, and the same 40-thread pool serves `/healthz`. A flood of plausible-looking requests can exhaust it, fail Render's health check and restart the service.
   *Fix:* cap body size, add cheap pre-checks, a concurrency limit and a rate limit.
   *2026-10-20:* `/scam-check` adds a bigger target: each call costs 2 Groq calls and up to 6 PayPal calls. It now has a global limit of 2 concurrent checks (503 above that), and `/healthz` is `async`, so it no longer waits for a pool thread. Body size and per-caller rate limits are still open.
+  *2026-10-21:* screenshots make a normal body up to about 4 MB, and a screenshot adds a third Groq call. The 3 MB image cap is checked only after the whole body has been read, so the body-size cap matters more now.
+  *2026-10-22:* the image is now capped as base64, before it is decoded. The whole body is still read and parsed as JSON first, whatever its size.
+
+- [ ] **18. Screenshots go to Groq with their metadata.** [app/llm.py](app/llm.py)
+  Added 2026-10-21 with the screenshot input, not from the review. The image bytes are sent as uploaded. A phone photo of a screen can carry EXIF data (GPS position, device), and so can a JPEG. With `LANGSMITH_TRACING=true` the image is also stored in the traces.
+  *Fix:* before real cases, re-encode the image without metadata (Pillow would then be a runtime dependency), or reject images that carry EXIF.
 
 ## LLM output
 
@@ -34,10 +40,26 @@ Authentication and authorization are still being built, so some of these may no 
 - [ ] **16. Nobody measures whether `detect_signals` catches real scams.** [app/scam_check.py:183](app/scam_check.py#L183)
   Added 2026-10-21, from a design discussion, not the review. The evals in `tests/test_eval_output_guardrails.py` only test the explanation. The signals never decide `VERIFIED` (PayPal does), but they decide `SCAM_LIKELY` and the warnings, and their recall and false-alarm rate are unknown.
   *Fix:* an opt-in eval (`pytest -m eval`) with 30–40 made-up but realistic chats in PT and EN: OLX/Vinted scams, MB WAY, "paguei a mais", own courier, fake PayPal emails, plus honest buyers. Check the expected signal types and `confirmed` per chat, and report recall and false alarms per signal. A second LLM reviewing the first is not the fix: it reads the same buyer text, so the same injection fools both.
+  *2026-10-21:* screenshots add a copy step before `detect_signals`. With a screenshot, `confirmed` means "in the model's copy", not "in the image". Run the same chats as screenshots too: `screenshot()` in `tests/test_eval_screenshot.py` draws them. Add real phone screenshots (WhatsApp, OLX, Vinted, dark mode) and photos of a screen, since the drawn ones are clean.
 
 - [ ] **17. Consider Jev (TypeSafe AI) for `detect_signals`.**
   Added 2026-10-21, an idea, not a finding. Jev does not generate text: it takes a state and typed questions (yes/no, rubric, multiple choice) and returns probabilities. That matches `detect_signals` (one yes/no per signal type) and would give a tunable threshold instead of a quote or null. It can also act as the judge for #15 *Next*. It is reachable from Pydantic AI (`typesafe:jev-latest`), DeepEval and Promptfoo.
   *Before deciding:* run it on the #16 eval and compare it with the current Groq model. Check pricing and data handling in TypeSafe's own docs, because buyer chats would be sent to a new vendor. Pin a version (`jev-1.13.0`-style) if a threshold is tuned. It returns no quote, so the `confirmed` check that stops invented quotes would need a replacement.
+
+## Chat
+
+- [ ] **19. The chat thread keeps the buyer's chat.** [app/chat.py](app/chat.py)
+  Added 2026-10-22 with the `chat` graph, not from the review. In the Chat tab every message enters `messages` before any node runs, so the checkpointer stores the buyer's chat (in `langgraph dev`: `.langgraph_api/`). `/scam-check` never stores it. The chat's LLM never reads it again, but it is personal data at rest. `RemoveMessage` only clears the latest state, and deleting a thread in `langgraph dev` leaves the message blobs on disk.
+  *Fix:* before the chat gets an API endpoint, take the buyer's chat in a field that is not a message, or run the check on a thread with no checkpointer.
+
+- [ ] **20. Names can reach Tavily.** [app/chat.py](app/chat.py)
+  Added 2026-10-22. The search query drops self-introductions ("I'm Amanda"), emails, links, phone numbers and IDs, but not other names ("my buyer John wants F&F"). Tavily's terms give it a perpetual licence over queries.
+  *Fix:* none planned yet. Turn off "Allow Use of Query Data" in the Tavily account, and revisit if real cases start.
+
+- [ ] **21. The PayPal notes cover only part of PayPal's rules.** [app/policy_pack.py](app/policy_pack.py)
+  Added 2026-10-22, when the 17 PayPal notes were verified. A question outside them gets Tavily links only, and `dispute_defense` (1–7 Nov) will need more than they give.
+  *To find and verify, each from a `https://www.paypal.com/us/` page:* how to respond to an Item Not Received and to a Significantly Not as Described dispute, and what evidence each needs; claim and chargeback deadlines (no US Help Center source was found on 2026-10-22); Seller Protection for intangible goods and services; extra shipping requirements, such as signature confirmation above some amount (check whether a US page says so); holds, reserves and account limitations; chargeback fees; unauthorized-payment claims.
+  *Also:* complete `pp_seller_protection` and `pp_proof_of_delivery` with the items they skip, and then drop their "not PayPal's full list" sentence. Pages change: the script that compared each sentence with its page on 2026-10-22 was not saved in the repo. Make it an opt-in eval (`pytest -m eval`) and rerun it before the demo.
 
 ## Tests
 

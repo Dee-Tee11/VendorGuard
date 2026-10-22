@@ -1,3 +1,5 @@
 -r requirements.txt
 pytest
 respx
+pillow
+langgraph-cli[inmem]  # Studio. Resolves langgraph-api 0.10.x (EOL): newer ones need an opentelemetry older than fastapi 0.149 allows

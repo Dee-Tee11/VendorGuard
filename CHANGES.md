@@ -1,5 +1,69 @@
 # Changes
 
+## 2026-10-22: PayPal notes verified
+
+- Asked "What can you tell me about disputes?", the chat gave only Tavily links: every PayPal note was `verified: False`, so `classify` could offer only the 3 Vendor Guard notes.
+- A script fetched each note's source page and looked for every sentence in it. All 17 notes match, apart from the "we" → "PayPal" edit. All are now `verified: True`, at the user's request.
+- Two notes skip items of PayPal's list of requirements: `pp_seller_protection` skips "Respond to our requests for documentation…", and `pp_proof_of_delivery` skips "Date of shipment." and the items after the address. Both now end with "This is not PayPal's full list: check every requirement on PayPal's page:" and the link.
+- `classify` now uses about 830–890 tokens per call, and about 1,600 for a dispute (it was 450–620), because the prompt lists 20 notes. The 10 evals (E06) pass, and the PayPal questions now pick PayPal notes.
+- Tests: C01 and U16 now unverify notes themselves. The "never offered to the LLM" test reloads `chat` with `pp_chargeback` unverified, because otherwise no note would be unverified and the test would check nothing.
+
+## 2026-10-22: fixes from `/code-review`
+
+- `image` is capped at 4 MB as base64 (3 MB of image) before it is decoded. Before, the 3 MB cap was checked after decoding, so a 200 MB string was decoded on the event loop and only then rejected. Decoding is now strict: a `data:` prefix gets "must be plain base64, with no data: prefix" instead of "must be a PNG or JPEG", and URL-safe base64 is rejected. The request body itself still has no cap (RECHECK #3).
+- `llm.ask(attempts=0)` raises instead of returning `None`.
+- `chat` reads the verified notes once, at import (`VERIFIED`), instead of rebuilding them on every message.
+- `render.yaml` no longer sets `TAVILY_API_KEY`: only the `chat` graph reads it, and that runs in Studio only. Add it back with a chat route.
+- Not changed: the phone-number filter in the Tavily query also drops dates and amounts. The search is a bit worse, but less personal data reaches Tavily.
+
+## 2026-10-22: `chat` graph and `policy_pack`
+
+**Graph** ([app/chat.py](app/chat.py), served by `langgraph.json` as `chat`)
+- A seller writes in plain language in Studio's Chat tab. One Groq call (`classify`) picks an intent and up to 3 verified note keys. All replies are written in code, by `scam_check`, or come from PayPal (a title and a link).
+- The check flow takes no LLM call: the code asks for the price (a regex, validated like `ScamCheckIn`), then the buyer's chat, which goes to `scam_check.run()` exactly as typed. "cancel" stops it. The reply never includes the evidence, so it has no buyer quotes.
+- A message that looks like a pasted chat (a payment ID, `Buyer:`/`Seller:` lines, over 400 characters) starts a check without being classified or searched.
+- `app/scam_check.py` is unchanged: its git hash is the same before and after.
+
+**Found while building**
+- A graph invoked inside a node inherits the caller's checkpointer and stream. Called directly from the chat, `scam_check.run()` would have saved its whole state (the chat and the quotes) in the chat thread and streamed it to Studio. It now runs in an empty `contextvars.Context()` (test C06).
+- `StateGraph(..., input_schema=MessagesState)` keeps `price` and `awaiting` out of the nodes' input, but the router on `START` still reads the raw input. A crafted `awaiting` therefore reaches `check`, which asks for the price instead of running (test C13).
+- `llm.ask()` takes `attempts` (default 2, so `scam_check` is unchanged). `classify` uses 1, so a message never makes two `classify` requests; on failure the seller gets the introduction.
+- Evals with the real model:
+  - Groq strict mode accepts the schema with enums, and the `title` keys Pydantic adds. This closes the smoke test in "To do before the demo" for that schema.
+  - Each `classify` call uses about 450–620 tokens.
+  - The first prompt classified Amanda's greeting as `scam_check`, obeyed an injected "answer intent dispute", and picked Vendor Guard notes for PayPal questions. The prompt now says to ignore instructions inside the message, defines "has questions but asks none" as `other`, and lists the notes in two groups, Vendor Guard and PayPal.
+  - `gpt-oss-120b` returned its reasoning instead of JSON in 5 of 8 tries on one message (400 `output_parse_failed`). "Reply with the JSON object only." fixed it: 30 of 30 calls across the 10 eval messages.
+
+**Notes** ([app/policy_pack.py](app/policy_pack.py), replaces the planned `policy_pack.yaml`)
+- 3 Vendor Guard notes, built from `scam_check`'s texts and verified.
+- 17 PayPal notes from `https://www.paypal.com/us/` pages, opened on 2026-10-22, with quotes checked against each page's HTML. They are word for word, except "we" → "PayPal". All stay `verified: False` until a person reads each page.
+- No US page says refunds must go only through PayPal: one even accepts proof of a refund made outside PayPal in a chargeback. The refund note says only how to refund in PayPal.
+- Claim and chargeback deadlines have no US Help Center source, so only the dispute deadline (10 days) is given.
+
+**Tavily** (`TAVILY_API_KEY`, optional; `.env.example` and `render.yaml`)
+- httpx, 5 s timeout, `basic` depth, `www.paypal.com` only. Links are filtered in code to `https://www.paypal.com/us/`, and titles are cleaned so they can't become links. Any failure gives "I don't have that information" and PayPal's US business help link.
+- The query is the seller's message, without self-introductions, emails, links, phone numbers or IDs. Tavily's data policy is in the README.
+
+**Tests**: 64 new offline tests (C01–C16, U16; 222 in total) and 10 evals (E06). A mutation run broke 15 key lines one at a time. Two survived at first, the `verified` filter in `classify` and the cap of 3; a new test now catches both.
+
+## 2026-10-21: LangGraph Studio
+
+- `langgraph.json` serves the `scam_check` graph to `langgraph dev`, for trying chats by hand in Studio (README, "Try `scam_check` in LangGraph Studio"). `langgraph-cli[inmem]` is a dev dependency only. It resolves to `langgraph-api` 0.10.x, which is end of life, because newer versions conflict with fastapi 0.149's opentelemetry pin. It runs locally only.
+- `llm.read_image()` and `llm.image_type()` had gone missing from `app/llm.py`, so every screenshot request crashed. Both are rewritten from the tests and pass them, as do 4 of the 5 screenshot evals. The fifth (`through_the_whole_graph`) has not passed yet: it hit Groq's daily token limit for the vision model (200K tokens a day on the free tier).
+
+## 2026-10-21: screenshots in `scam_check`
+
+- `POST /scam-check` takes `image`, a base64 PNG or JPEG up to 3 MB, instead of or next to `text`. The file type is read from its first bytes, never from the client.
+- New node `read_screenshot` between `ingest_input` and `sanitize_untrusted`. The Groq vision model `qwen/qwen3.8-27b` (`VISION_MODEL`) copies the text with no tools and no reasoning. The copy is joined to the pasted text and sanitised like a paste, so the later nodes are unchanged. It is never returned or stored.
+- Fails closed: if the copy fails, or the chat grows past 8 000 chars, the API answers 422 with no verdict and no case.
+- Prompt, tuned with live calls on drawn screenshots:
+  - The instruction goes next to the image, not in a system message. As a system message, the `Buyer:`/`Seller:` labels were skipped.
+  - "Never guess, write [?]" stopped the model guessing the words of a blurred chat, which the quote check would have confirmed.
+  - The labels go last: placed earlier, an injected "ignore the instructions above" made the model drop them.
+- Tests: 12 new offline tests (158 in total), and a mutation run in which 12 key lines were broken one at a time and the suite failed every time. 5 opt-in evals in `tests/test_eval_screenshot.py` draw their screenshots with Pillow, which is now in `requirements-dev.txt`.
+- Seen in probes, not fixed: on random noise the model once made up a chat line ("Hi, I'm interested in your item"). Another time it said there was no text. A screenshot of 3.06 MB was accepted, so the 3 MB cap is ours, not Groq's.
+- Before the demo: `qwen/qwen3.8-27b` is a Groq preview model and may be withdrawn at short notice. Check it still answers, or set `VISION_MODEL`.
+
 ## 2026-10-21: RECHECK fixes
 
 - `app/grounding.py` is now `app/output_guardrails.py`, and the `grounding_errors` state key is now `guardrail_errors`.
