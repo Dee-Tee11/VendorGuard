@@ -113,10 +113,10 @@ flowchart TD
   C -- question --> Q[question]
   C -- scam_check --> S
   C -- dispute --> D[dispute]
-  C -- other --> O[other]
+  C -- other or not_paypal --> O[other]
 ```
 
-One Groq call per message, `classify`, picks closed choices only: an intent (`question`, `scam_check`, `dispute` or `other`) and up to 3 keys of verified `policy_pack` notes.
+One Groq call per message, `classify`, picks closed choices only: an intent (`question`, `scam_check`, `dispute`, `not_paypal` or `other`) and up to 3 keys of verified `policy_pack` notes.
 
 - **What it sees:** only the current message, sanitised and inside `<question>` tags, and the titles of the verified notes.
 - **What it never sees:** earlier messages, the buyer's chat, a check's result or search results.
@@ -135,6 +135,7 @@ Every reply is written in `app/chat.py`, by `scam_check`, or comes from PayPal (
   - Screenshots are not supported here yet.
 - **dispute:** fixed text, plus the verified dispute notes. Once `dispute_defense` exists, this is where the chat will ask for the dispute ID.
 - **other:** what Vendor Guard does, the titles of the verified notes, and how to start a check.
+- **not_paypal:** a check or a dispute that isn't on PayPal (a bank transfer, another app, another marketplace) goes to the same node, which says Vendor Guard only works with PayPal.
 
 Things that are easy to get wrong:
 
@@ -355,7 +356,7 @@ The plan has 61 test cases in six layers, plus C01–C16 for the chat, tracked b
   - The buyer's chat never reaches the chat's LLM or Tavily, and no quotes appear in the reply or in the thread.
   - Pasted chats, the tag injection, the link filter, Tavily failures, personal data in the search, one Groq request per message, no tools or secrets.
   - U16: the `policy_pack` sources, and that unverified notes are never offered or shown.
-  - E06 (tests/test_eval_chat.py, `pytest -m eval -s`): 10 messages, the real Groq model, 10 of 10. Each call uses about 450–620 tokens.
+  - E06 (tests/test_eval_classify_chat.py, `pytest -m eval -s`): the 39 cases in tests/chat_dataset.jsonl, all in English, the real Groq model. Each run saves every reply and the KPIs (routing, intent, notes shown, LLM calls) to tests/eval_results/, which git ignores. Each call uses about 830–890 tokens, about 1,600 for a dispute. No SDK retries, as in the app: a 429 waits 60 s and tries once more.
 
 The tests mock PayPal and Groq and replace the database calls, so they need neither credentials nor Postgres. They do not exercise the real SQL in `db.claim_event` or `db.save_case` (see RECHECK #7). Test IDs follow this README's grouping; there is no separate test-plan document.
 

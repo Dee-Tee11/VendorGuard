@@ -1,5 +1,17 @@
 # Changes
 
+## 2026-10-24: E06 fixes from `/code-review`, and `not_paypal`
+
+- New intent `not_paypal`: a check or dispute that isn't on PayPal (a bank transfer, Zelle, an eBay case) gets "Vendor Guard only works with PayPal…" from the `other` node, instead of the intro. Before, the `other` rule ("anything not about PayPal") could send these to the intro with no word on why. Three new E06 cases cover it.
+- The E06 dataset is in English only (the product targets the US), and the eval file is now `tests/test_eval_classify_chat.py`.
+- E06 fixes:
+  - A classify call that failed after Groq answered (cut off, invalid JSON) was not counted, and the fallback to `other` scored as a pass. `llm.ask` is now wrapped too.
+  - A case that crashed left no row and dropped out of the KPIs. It now gets a row with its error, scored as a failure (`ran without error`).
+  - "required notes" counted the notes `classify` picked. It now counts the notes the seller saw.
+  - The eval's client had SDK retries (up to 6), hidden inside one call. It now has none, as in the app: a 429 waits 60 s and tries once more, and the KPIs count those waits.
+  - One graph for all cases, the KPI report built once, and the unused multi-turn replay removed.
+- Not changed: the dataset is still read at import, so a broken line stops plain `pytest` at collection. A broken dataset should fail loudly.
+
 ## 2026-10-22: PayPal notes verified
 
 - Asked "What can you tell me about disputes?", the chat gave only Tavily links: every PayPal note was `verified: False`, so `classify` could offer only the 3 Vendor Guard notes.

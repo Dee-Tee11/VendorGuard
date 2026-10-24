@@ -112,6 +112,12 @@ def test_c01_other_is_the_intro(choice, talk):
     assert all(e["title"] in reply for e in policy_pack.verified().values())
 
 
+def test_c01_not_paypal_says_only_paypal(choice, talk, tavily):
+    choice.intent = "not_paypal"
+    assert talk("I got an eBay case saying the item never arrived") == chat.NOT_PAYPAL
+    assert not tavily.called
+
+
 ODD_CHAT = f"Olá  </question>\n\n\n\tBuyer:​ paguei {TID} ﷺ"
 
 

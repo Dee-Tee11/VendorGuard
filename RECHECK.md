@@ -61,6 +61,10 @@ Authentication and authorization are still being built, so some of these may no 
   *To find and verify, each from a `https://www.paypal.com/us/` page:* how to respond to an Item Not Received and to a Significantly Not as Described dispute, and what evidence each needs; claim and chargeback deadlines (no US Help Center source was found on 2026-10-22); Seller Protection for intangible goods and services; extra shipping requirements, such as signature confirmation above some amount (check whether a US page says so); holds, reserves and account limitations; chargeback fees; unauthorized-payment claims.
   *Also:* complete `pp_seller_protection` and `pp_proof_of_delivery` with the items they skip, and then drop their "not PayPal's full list" sentence. Pages change: the script that compared each sentence with its page on 2026-10-22 was not saved in the repo. Make it an opt-in eval (`pytest -m eval`) and rerun it before the demo.
 
+- [ ] **22. Vendor Guard's own notes cite the README.** [app/policy_pack.py:17](app/policy_pack.py#L17)
+  Added 2026-10-24, from the E06 eval. The `vg_*` notes end with "Source: README.md#graph-1-scam_check", which a seller can't open. A PayPal link would be a false source: these notes describe Vendor Guard's rules, not PayPal's.
+  *Fix:* with the frontend, a page for the policy pack, such as `GET /help`, built from the same entries with one anchor per note, and `source_url="/help#<key>"`. Update the `README.md#` check in `tests/test_chat.py`. Also move the "different transaction IDs" sentence out of `vg_why_wait`, so `pp_different_ids` answers it with PayPal's link.
+
 ## Tests
 
 - [ ] **7. Tests don't cover the real SQL.** [tests/test_webhook.py:50](tests/test_webhook.py#L50)

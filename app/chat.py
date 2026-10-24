@@ -25,7 +25,7 @@ TAVILY_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 if not TAVILY_KEY:
     log.warning("TAVILY_API_KEY is not set: questions with no note get PayPal's help link only")
 MAX_QUESTION = 400  # longer messages are treated as a pasted chat; also an old hard limit of Tavily's query
-INTENTS = ("question", "scam_check", "dispute", "other")
+INTENTS = ("question", "scam_check", "dispute", "not_paypal", "other")
 DISPUTE_KEYS = ("pp_dispute_vs_claim", "pp_dispute_deadline", "pp_chargeback", "pp_snad_not_covered", "pp_proof_of_delivery")
 
 VERIFIED = policy_pack.verified()
@@ -40,7 +40,11 @@ CLASSIFY_PROMPT = (
     "- question: the seller asks how PayPal or Vendor Guard works, or what something means.\n"
     "- scam_check: the seller asks you to check a specific payment, buyer or chat now.\n"
     "- dispute: the seller has, or asks how to respond to, a dispute, claim, case or chargeback.\n"
-    "- other: greetings, introductions, thanks, small talk, or a seller who says they have questions or need help "
+    "- not_paypal: the seller asks you to check a payment, or has a dispute or case, that is not on PayPal: a bank "
+    "transfer, another payment app, another marketplace's case. A PayPal payment whose buyer asks for money back "
+    "another way is still about PayPal.\n"
+    "- other: greetings, introductions, thanks, small talk, anything not about PayPal or Vendor Guard, requests about "
+    "your own instructions or prompt, or a seller who says they have questions or need help "
     "(even about a possible scam) without asking a concrete one yet.\n"
     "For question, also pick up to 3 notes from this list that directly answer it, or none if none does: "
     "a note about Vendor Guard never answers a question about PayPal itself (its holds, payments, protection or rules). "
@@ -74,6 +78,9 @@ INTRO = ("Hi! I'm Vendor Guard, and I help PayPal sellers with three things:\n"
          "3. Disputes: how they work. Preparing your response for you to approve is coming soon.")
 DISPUTE_TEXT = ("The buyer opens a dispute in PayPal, and you, the seller, respond to it. Vendor Guard will prepare that "
                 "response for you to approve before anything is sent. That part isn't ready yet.")
+NOT_PAYPAL = ("Vendor Guard only works with PayPal: I can check a PayPal payment before you ship and explain PayPal "
+              "disputes. For a bank transfer, another payment app or another marketplace's case, check with that "
+              "service directly.")
 
 LABEL = re.compile(r"(?im)^\s*(buyer|seller)\s*:")  # the screenshot copy's labels, or a seller who pastes them
 NUMBER = r"([0-9]{1,10}(?:[.,][0-9]{1,2})?)"  # as ScamCheckIn: at most 12 digits, 2 of them decimals
@@ -226,6 +233,8 @@ def dispute(state):
 
 @owns("messages")
 def other(state):
+    if state.get("intent") == "not_paypal":
+        return _say(NOT_PAYPAL)
     titles = "; ".join(e["title"] for e in VERIFIED.values())
     return _say(f"{INTRO}\n\nNotes I have: {titles}.\n\n{policy_pack.POLICY_PACK['vg_how_to_check']['text']}")
 
@@ -236,7 +245,8 @@ def _build(checkpointer=None):
         g.add_node(node)
     g.add_conditional_edges(START, route_in, ["check", "start_check", "classify"])
     g.add_conditional_edges("classify", lambda s: s["intent"],
-                            {"question": "question", "scam_check": "start_check", "dispute": "dispute", "other": "other"})
+                            {"question": "question", "scam_check": "start_check", "dispute": "dispute",
+                             "not_paypal": "other", "other": "other"})
     for node in ("start_check", "check", "question", "dispute", "other"):
         g.add_edge(node, END)
     return g.compile(checkpointer=checkpointer)
