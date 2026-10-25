@@ -18,7 +18,7 @@ PayPal is the source of truth in both graphs, and nothing that moves money happe
 | Postgres storage, Render blueprint | Done (`render.yaml` written) |
 | Seller authentication, single-use approval tokens | In progress |
 | `scam_check` graph and `POST /scam-check` | Done, screenshots included (U01–U05, U09–U10, U17–U20, N01–N04, S01–S06) |
-| Live sandbox demo (`/demo`): sell, pay as a test buyer, check the chat, ask the chat, watch every step | Built, and run locally against the sandbox with a real payment (D01–D16). Needs a Render deploy |
+| Live sandbox demo (`/demo`): sell, pay as a test buyer, check the chat, ask the chat, watch every step | Built, and run locally against the sandbox with a real payment (D01–D17). Needs a Render deploy |
 | `chat` graph and `policy_pack` | Done in Studio and on the demo page through `POST /demo/api/chat` (C01–C17, U16, E06, D12–D17). No endpoint outside the demo until auth lands |
 | `dispute_defense` graph, approval screen, Bryntum board | Planned, 1–7 Nov |
 | Evaluation set, published numbers, demo video | Planned, 8–12 Nov |
@@ -213,7 +213,9 @@ A public page where anyone can try Vendor Guard against PayPal's sandbox, and se
 2. **Pay as the test buyer**: PayPal's own checkout (JS SDK) with a shared sandbox buyer account, whose email and password the page shows. The server creates the order and captures it after approval.
 3. **Check the buyer's chat**: start from an honest buyer, an overpayment, a fake PayPal email or a prompt injection, edit it, or add a screenshot.
 
-Below the steps, **Ask Vendor Guard** runs the `chat` graph: questions answered from the verified notes, "check" to verify a payment over three messages, disputes, and a "PayPal only" reply for other services. Each demo session has its own conversation, kept in memory (`InMemorySaver`, thread id = session id) and forgotten when the session ends or the service restarts. The live panel shows how each message was routed: the intent and notes the model picked, or that the code routed it with no model call.
+Below the steps, **Ask Vendor Guard** runs the `chat` graph: questions answered from the verified notes, "check" to verify a payment over three messages, disputes, and a "PayPal only" reply for other services. Each demo session has its own conversation, kept in memory (`InMemorySaver`, thread id = session id) and forgotten when the session ends or the service restarts. The live panel shows how each message was routed: the intent and notes the model picked, or that the code routed it with no model call. At the chat step, the Screenshot button sends the buyer's chat as an image instead of text.
+
+Each paid sale has a "Download receipt" button: a PNG of the real sandbox capture, drawn in the browser and labelled as the demo's, to try screenshots with.
 
 Next to the steps, a live panel shows each `scam_check` node as it runs and what it wrote, every PayPal call with its HTTP status and response body, and the verified webhooks about the tester's sales. The panel shows the tester what they sent (the cleaned chat, the screenshot's text, the quotes), which `/scam-check` never returns.
 
@@ -241,7 +243,7 @@ Next to the steps, a live panel shows each `scam_check` node as it runs and what
 | `POST /demo/api/session` | Built, `DEMO_MODE` only | `{session_id, client_id, currency, buyer_email, buyer_password}`. The other demo routes need the id in `X-Demo-Session`, and answer 401 once the session ended or went idle. |
 | `POST /demo/api/orders`, `POST /demo/api/orders/{id}/capture` | Built, `DEMO_MODE` only | Create a USD order for `{item, amount}`, then capture it: `{capture_id, status, amount, currency}`. 404 for another session's order, 502 when PayPal refuses. |
 | `POST /demo/api/check` | Built, `DEMO_MODE` only | The `/scam-check` body. Streams NDJSON lines: `paypal` (method, path, status, body), `node` (name, update), then `result` (as `/scam-check`) or `error`. |
-| `POST /demo/api/chat` | Built, `DEMO_MODE` only | Body `{message}`, up to 8 000 chars. One message to the `chat` graph on the session's thread: `{reply, route, intent, notes, awaiting}`. `route` is the node that answered; `intent` and `notes` are set only when the model classified the message. 503 when the message would run a check and two are running, 409 while the session's previous message is still running. |
+| `POST /demo/api/chat` | Built, `DEMO_MODE` only | Body `{message, image}`, a message up to 8 000 chars, a screenshot (as `/scam-check`'s `image`) or both. One message to the `chat` graph on the session's thread: `{reply, route, intent, notes, awaiting}`. `route` is the node that answered; `intent` and `notes` are set only when the model classified the message. A message that runs a check counts as a check, and as a screenshot if it has one. 503 when the message would run a check and two are running, 409 while the session's previous message is still running. |
 | `GET /demo/api/state`, `POST /demo/api/end` | Built, `DEMO_MODE` only | The session's sales and the webhook events about them; ending deletes the session and all it left (409 while a chat message is running). |
 | `POST /disputes/{id}/decision` | Planned | Approve, edit or reject a draft |
 | `GET /api/board` | Planned | Only the authenticated seller's disputes, with no buyer messages or contacts |
@@ -261,14 +263,14 @@ app/ratelimit.py    per-IP hourly limits for the open endpoints
 app/static/demo.html  the demo page: plain HTML, CSS and JS, no build
 app/paypal.py       signature-header checks, OAuth token cache, verify-webhook-signature, capture and Transaction Search lookups
 app/db.py           schema bootstrap, claim_event() (idempotent insert), save_case(), the demo's tables and cleanup
-app/scam_check.py   the scam_check graph: @owns, sanitize, the 10 nodes, verdict table, policy texts
+app/scam_check.py   the scam_check graph: @owns, sanitize, the 11 nodes, verdict table, policy texts
 app/chat.py         the chat graph: route_in, classify, the check flow, the Tavily search
 app/policy_pack.py  the notes the chat shows: Vendor Guard's and PayPal's, with sources and `verified`
 app/output_guardrails.py  Sentence model, validate() and render() for LLM-written sentences
 app/llm.py          the Groq calls, no tools: ask() with a strict JSON schema, read_image() for screenshots
 tests/              pytest + respx (PayPal and Groq are mocked, no database needed); tests/test_db.py runs the real SQL
 langgraph.json      serves the scam_check and chat graphs to `langgraph dev` and LangGraph Studio
-render.yaml         Render blueprint: web service + free Postgres
+render.yaml         Render blueprint: the web service (Postgres is on Neon, set by DATABASE_URL)
 ```
 
 ## Stack
@@ -280,11 +282,11 @@ render.yaml         Render blueprint: web service + free Postgres
 | Core | `langgraph-checkpoint-postgres` | planned |
 | Search | Tavily Search API through httpx, no SDK (`chat` only) | yes, optional |
 | PayPal | Sandbox (US test accounts): Payments v2, Transaction Search, Disputes v1, Tracking, `verify-webhook-signature` | webhook verification only |
-| Infra | Render (web service, Postgres, cron job), cloudflared or ngrok for local webhooks | blueprint written |
+| Infra | Render (web service, cron job), Neon Postgres, cloudflared or ngrok for local webhooks | blueprint written |
 | Interface | Bryntum Scheduler (trial), Jinja2, HTMX, vanilla JS | planned |
 | Tests | pytest, respx, Pillow (draws the eval screenshots); pytest-asyncio, RAGAS and promptfoo later | pytest, respx, Pillow |
 | DevSecOps | GitHub Actions, Bandit or Semgrep, pip-audit | planned |
-| Observability | Langfuse or LangSmith (optional) | planned |
+| Observability | LangSmith (`@traceable` on the Groq calls, EU region, off unless `LANGSMITH_TRACING=true`, made-up chats only) | yes, optional |
 
 ## Configuration
 
@@ -357,7 +359,7 @@ pytest              # offline: PayPal and Groq mocked
 pytest -m eval -v    # evals: the real Groq model, key from .env, made-up chats only
 ```
 
-The plan has 61 test cases in six layers, plus C01–C16 for the chat, tracked by ID:
+The plan has 61 test cases in six layers, plus C01–C17 for the chat and D01–D17 for the demo, tracked by ID:
 
 | Layer | IDs | What it covers | Where it runs |
 |---|---|---|---|
@@ -365,8 +367,8 @@ The plan has 61 test cases in six layers, plus C01–C16 for the chat, tracked b
 | Node (mock) | N01–N10 | LLM and API nodes against simulated PayPal errors (429, 503, `ERRDIS…`) | CI |
 | Sandbox | G01–G12 | End to end on PayPal Sandbox, including resume after restart | manual scripts |
 | Security | S01–S11 | Prompt injection, forged webhooks, token replay, no tools on LLM nodes | pytest + promptfoo |
-| Chat | C01–C16 | `app/chat.py`: routing, the check flow, Tavily, links, personal data | CI, Groq and Tavily mocked |
-| Demo | D01–D16 | `/demo`: off by default, sandbox only, sessions, orders, the streamed check, the chat, per-IP limits | CI, PayPal and Groq mocked |
+| Chat | C01–C17 | `app/chat.py`: routing, the check flow, screenshots, Tavily, links, personal data | CI, Groq and Tavily mocked |
+| Demo | D01–D17 | `/demo`: off by default, sandbox only, sessions, orders, the streamed check, the chat, per-IP limits | CI, PayPal and Groq mocked |
 | Evaluation | E01–E05 | 60 labelled chats, 20 sandbox disputes, 30 injection variants, 50 drafts | scripts + RAGAS |
 | Spike | P01–P02 | Which payment source feeds the ledger, and whether simulator events verify | manual |
 
@@ -383,12 +385,12 @@ The plan has 61 test cases in six layers, plus C01–C16 for the chat, tracked b
   - N01–N04: PayPal 404, 403, 429, 503, timeouts, token failure, Transaction Search rows, LLM and database failures.
   - S01–S06: prompt injection, unverifiable quotes, no tools and no secrets in prompts, no ship wording from the LLM, Unicode and tag tricks.
 - `chat` (tests/test_chat.py):
-  - C01–C16: every intent, the price and the chat flow, and cancel.
+  - C01–C17: every intent, the price and the chat flow, a screenshot at the chat step, and cancel.
   - The buyer's chat never reaches the chat's LLM or Tavily, and no quotes appear in the reply or in the thread.
   - Pasted chats, the tag injection, the link filter, Tavily failures, personal data in the search, one Groq request per message, no tools or secrets.
   - U16: the `policy_pack` sources, and that unverified notes are never offered or shown.
   - E06 (tests/test_eval_classify_chat.py, `pytest -m eval -s`): the 39 cases in tests/chat_dataset.jsonl, all in English, the real Groq model. Each run saves every reply and the KPIs (routing, intent, notes shown, LLM calls) to tests/eval_results/, which git ignores. Each call uses about 830–890 tokens, about 1,600 for a dispute. No SDK retries, as in the app: a 429 waits 60 s and tries once more.
-- Demo (tests/test_demo.py): D01–D16. The routes are 404 when off, the app won't start against live PayPal, another session's order is never captured, the stream lists every node and PayPal call (no token) and ends with the same verdict as `/scam-check`, a busy check is an error line and every check gives its slot back, and the per-IP limits ignore forged `X-Forwarded-For` entries. The chat answers from a verified note, runs a check over three messages on its own session's thread (counted as a check, its case tied to the session), refuses that message with 503 when no slot is free, takes one message at a time per session (409), and forgets the thread when the session ends or is swept.
+- Demo (tests/test_demo.py): D01–D17. The routes are 404 when off, the app won't start against live PayPal, another session's order is never captured, the stream lists every node and PayPal call (no token) and ends with the same verdict as `/scam-check`, a busy check is an error line and every check gives its slot back, and the per-IP limits ignore forged `X-Forwarded-For` entries. The chat answers from a verified note, runs a check over three messages on its own session's thread (counted as a check, its case tied to the session), refuses that message with 503 when no slot is free, takes one message at a time per session (409), counts a chat screenshot as a check and a screenshot, and forgets the thread when the session ends or is swept.
 
 The tests mock PayPal and Groq and replace the database calls, so they need neither credentials nor Postgres. `tests/test_db.py` runs the real SQL (the claims, saving a case, the demo's tables and its cleanup) against a throwaway Postgres, and is skipped unless `TEST_DATABASE_URL` is set:
 
@@ -410,4 +412,4 @@ Test IDs follow this README's grouping; there is no separate test-plan document.
 
 ## Deploy
 
-`render.yaml` defines the web service and a free Postgres. Set `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`, `GROQ_API_KEY` and, optionally, `TAVILY_API_KEY` in the Render dashboard (they are `sync: false`). For the live demo, also set `DEMO_MODE=true`, `DEMO_BUYER_EMAIL` and `DEMO_BUYER_PASSWORD`, and subscribe the webhook to `PAYMENT.CAPTURE.*` and `CHECKOUT.ORDER.APPROVED` (and `CUSTOMER.DISPUTE.*` for later). Dispute creation, `require-evidence` and `adjudicate` exist only in the sandbox. Always check a dispute's HATEOAS links before calling an action.
+`render.yaml` defines the web service only; the database is a Neon Postgres. Set `DATABASE_URL` (Neon's direct connection, not the pooler), `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID` and `GROQ_API_KEY` in the Render dashboard (they are `sync: false`). `TAVILY_API_KEY` is optional and not in the blueprint, so add it by hand. For the live demo, also set `DEMO_MODE=true`, `DEMO_BUYER_EMAIL` and `DEMO_BUYER_PASSWORD`, and subscribe the webhook to `PAYMENT.CAPTURE.*` and `CHECKOUT.ORDER.APPROVED` (and `CUSTOMER.DISPUTE.*` for later). Dispute creation, `require-evidence` and `adjudicate` exist only in the sandbox. Always check a dispute's HATEOAS links before calling an action.

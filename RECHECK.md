@@ -38,6 +38,7 @@ Authentication and authorization are still being built, so some of these may no 
 - [ ] **24. Ending a demo session during a check can leave rows behind.** [app/db.py](app/db.py)
   Added 2026-10-24. If "End demo" runs while a check of the same session is running, the session's `demo_cases` row is deleted first, and the check then saves its `scam_cases` and `claimed_payments` rows, which nothing deletes. They hold no chat and no quotes.
   *Fix:* if it matters, sweep `scam_cases` and `claimed_payments` rows whose case has no session, or let `/demo/api/end` wait for the session's running check.
+  *2026-10-25:* fixed for checks run through the chat: `demo.turn` runs a chat message and "End demo" one at a time (409). Still open for step 3: `/demo/api/check` takes `demo.session`, not `demo.turn`, so "End demo" can run while that check is running.
 
 ## LLM output
 
