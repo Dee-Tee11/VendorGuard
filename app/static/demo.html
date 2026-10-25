@@ -378,7 +378,8 @@ async function refresh() {
   $("sales").replaceChildren(...state.sales.map((s) => el("li", {},
     el("span", {}, s.item), el("span", {}, `${s.amount} USD`),
     s.capture_id ? el("span", {}, "Transaction ", el("code", {}, s.capture_id), ` ${s.capture_status} `,
-      el("button", {class: "btn quiet", type: "button", onclick: () => receipt(s)}, "Download receipt"))
+      el("button", {class: "btn quiet", type: "button", onclick: () => receipt(s, "buyer")}, "Buyer's receipt"),
+      el("button", {class: "btn quiet", type: "button", onclick: () => receipt(s, "seller")}, "Seller's receipt"))
       : el("span", {}, "not paid yet"))));
   for (const e of state.events) {
     if (seenEvents.has(e.id)) continue;
@@ -387,14 +388,18 @@ async function refresh() {
   }
 }
 
-// a PNG of a real sandbox capture, to test screenshots in step 3. Labelled as the demo's: no PayPal branding
-function receipt(s) {
+// a PNG of a real sandbox capture, to test screenshots in step 3. Labelled as the demo's: no PayPal branding.
+// The buyer's copy is what a buyer could forward; the seller's is what the seller's own account shows.
+function receipt(s, who) {
+  const buyer = who === "buyer";
   const lines = [
-    ["Vendor Guard sandbox demo: payment receipt", "bold 26px sans-serif"],
+    [`Vendor Guard sandbox demo: ${buyer ? "payment receipt (buyer's copy)" : "payment received (seller's copy)"}`,
+      "bold 24px sans-serif"],
     ["Sandbox test payment, no real money", "16px sans-serif"],
     ["", ""],
     [`Item: ${s.item}`, "20px sans-serif"],
-    [`Amount: ${s.amount} USD`, "bold 22px sans-serif"],
+    [`${buyer ? "You paid" : "You received"}: ${s.amount} USD`, "bold 22px sans-serif"],
+    ...(buyer ? [] : [[`Order ID: ${s.order_id}`, "20px monospace"]]),
     [`Transaction ID: ${s.capture_id}`, "20px monospace"],
     [`Status: ${s.capture_status}`, "20px sans-serif"],
     [`Downloaded: ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC`, "16px sans-serif"],
@@ -405,7 +410,7 @@ function receipt(s) {
   g.fillRect(0, 0, c.width, c.height);
   g.fillStyle = "#111";
   lines.forEach(([text, font], i) => { g.font = font || "16px sans-serif"; g.fillText(text, 30, 50 + 40 * i); });
-  el("a", {href: c.toDataURL("image/png"), download: `receipt-${s.capture_id}.png`}).click();
+  el("a", {href: c.toDataURL("image/png"), download: `receipt-${who}-${s.capture_id}.png`}).click();
 }
 
 // ---- step 3: scenarios ----
@@ -510,6 +515,26 @@ function showResult(r) {
   ].filter(Boolean));
 }
 
+// fills the price from the screenshot, never checks with it: a receipt shows what was paid, not what the seller asked
+async function suggestPrice(file) {
+  $("run").disabled = true;
+  note("check-note", "No price yet: reading the amount in the screenshot…");
+  try {
+    const p = await (await api("/demo/api/price", {image: await readImage(file)})).json();
+    if (p.currency === "USD") {
+      $("expected").value = p.amount;
+      note("check-note", `The screenshot says ${p.amount} USD. Is that the price you asked for? Change it if not, then check.`);
+    } else {
+      note("check-note", p.amount ? `The screenshot says ${p.amount} ${p.currency}, and this demo checks USD only. Enter the price you asked for.`
+        : "I couldn't find one amount in the screenshot. Enter the price you asked for.", true);
+    }
+  } catch (e) {
+    if (!(e instanceof Ended)) note("check-note", e.message, true);
+  } finally {
+    $("run").disabled = false;
+  }
+}
+
 async function check(event) {
   event.preventDefault();
   note("check-note", "");
@@ -517,8 +542,9 @@ async function check(event) {
   const file = $("shot").files[0];
   const expected = Number($("expected").value);
   if (!text.trim() && !file) return note("check-note", "Paste a chat or add a screenshot first.", true);
-  if (!(expected > 0)) return note("check-note", "Enter the price you asked for.", true);
   if (file && file.size > 3_000_000) return note("check-note", "The screenshot must be under 3 MB.", true);
+  if (!(expected > 0) && file) return suggestPrice(file);
+  if (!(expected > 0)) return note("check-note", "Enter the price you asked for.", true);
   $("run").disabled = true;
   $("result").replaceChildren();
   rail("running");

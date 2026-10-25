@@ -176,6 +176,17 @@ def demo_check(body: ScamCheckIn, request: Request, session_id: str = Depends(de
     return StreamingResponse(_stream_check(body, session_id), media_type="application/x-ndjson")
 
 
+class PriceIn(BaseModel):
+    image: Screenshot
+
+
+@app.post("/demo/api/price", dependencies=[Depends(demo.enabled)])
+def demo_price(body: PriceIn, request: Request, session_id: str = Depends(demo.session)):
+    """The amount a screenshot shows, for the seller to confirm as their price; nulls when it shows none."""
+    ratelimit.hit(request, "price")  # one vision call each
+    return demo.read_price(body.image) or {"amount": None, "currency": None}
+
+
 class ChatIn(BaseModel):
     message: str = Field("", max_length=scam_check.MAX_CHARS)
     image: Screenshot | None = None  # the buyer's chat as a screenshot, read only by the check

@@ -53,7 +53,7 @@ def lines(r):
 
 def test_d01_off_by_default():
     for method, path in [("GET", "/demo"), ("POST", "/demo/api/session"), ("POST", "/demo/api/check"),
-                         ("POST", "/demo/api/chat")]:
+                         ("POST", "/demo/api/chat"), ("POST", "/demo/api/price")]:
         assert client.request(method, path, json=CHECK).status_code == 404
 
 
@@ -255,3 +255,15 @@ def test_d17_a_screenshot_in_the_chat_runs_the_check_and_counts_as_one(demo_db, 
     assert [len(ratelimit._hits[("1.1.1.1", k)]) for k in ("check", "screenshot")] == [1, 1]
     for bad in ({"message": ""}, {"message": "", "image": "R0lGODlhAQABAAAAACw="}, {"image": "data:image/png;base64,x"}):
         assert client.post("/demo/api/chat", json=bad, headers=h).status_code == 422
+
+
+def test_d18_a_screenshot_suggests_a_price_and_never_runs_a_check(demo_db, monkeypatch):
+    said = iter(["45.00 USD", "You paid $45.00", "NONE", "12 EUR", "1 USD"])
+    monkeypatch.setattr(main.llm, "read_image", lambda prompt, image: next(said))
+    monkeypatch.setattr(scam_check, "run", lambda *args: pytest.fail("a price read must not run a check"))
+    h, png = start(), {"image": "iVBORw0KGgoAAAAAAAAAAA=="}
+    got = [client.post("/demo/api/price", json=png, headers=h).json() for _ in range(5)]
+    assert got == [{"amount": "45.00", "currency": "USD"}] + [{"amount": None, "currency": None}] * 2 + [
+        {"amount": "12", "currency": "EUR"}, {"amount": "1", "currency": "USD"}]  # only what parse_price accepts
+    assert client.post("/demo/api/price", json=png, headers=h).status_code == 429  # 5 an hour: each is a vision call
+    assert client.post("/demo/api/price", json=png).status_code == 401

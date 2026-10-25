@@ -93,4 +93,4 @@ Authentication and authorization are still being built, so some of these may no 
   - cancelling, or asking a question, halfway through;
   - an image that isn't PNG or JPEG, and two images;
   - EN and PT.
-  Draw the screenshots with Pillow, as `tests/test_eval_screenshot.py` does, or use the demo's "Download receipt". Run it like the E06 eval, and fix #26 against it.
+  Draw the screenshots with Pillow, as `tests/test_eval_screenshot.py` does, or use the demo's "Buyer's receipt" and "Seller's receipt". Run it like the E06 eval, and fix #26 against it.

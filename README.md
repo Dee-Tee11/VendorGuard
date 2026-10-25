@@ -215,7 +215,7 @@ A public page where anyone can try Vendor Guard against PayPal's sandbox, and se
 
 Below the steps, **Ask Vendor Guard** runs the `chat` graph: questions answered from the verified notes, "check" to verify a payment over three messages, disputes, and a "PayPal only" reply for other services. Each demo session has its own conversation, kept in memory (`InMemorySaver`, thread id = session id) and forgotten when the session ends or the service restarts. The live panel shows how each message was routed: the intent and notes the model picked, or that the code routed it with no model call. At the chat step, the Screenshot button sends the buyer's chat as an image instead of text.
 
-Each paid sale has a "Download receipt" button: a PNG of the real sandbox capture, drawn in the browser and labelled as the demo's, to try screenshots with.
+Each paid sale has "Buyer's receipt" and "Seller's receipt" buttons: PNGs of the real sandbox capture, one for each side, drawn in the browser and labelled as the demo's, to try screenshots with. With a screenshot and no price, step 3 reads the amount from the screenshot and fills it in for you to confirm: it never checks with it unconfirmed, since a receipt shows what was paid, not what you asked.
 
 Next to the steps, a live panel shows each `scam_check` node as it runs and what it wrote, every PayPal call with its HTTP status and response body, and the verified webhooks about the tester's sales. The panel shows the tester what they sent (the cleaned chat, the screenshot's text, the quotes), which `/scam-check` never returns.
 
