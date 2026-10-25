@@ -17,14 +17,15 @@ PayPal is the source of truth in both graphs, and nothing that moves money happe
 | Webhook intake: signature check and dedupe (`/webhooks/paypal`) | Done (tests U11, U12, S07) |
 | Postgres storage, Render blueprint | Done (`render.yaml` written) |
 | Seller authentication, single-use approval tokens | In progress |
-| `scam_check` graph and `POST /scam-check` | Done, screenshots included (U01–U05, U09–U10, U17–U20, N01–N04, S01–S06). Paste page planned |
+| `scam_check` graph and `POST /scam-check` | Done, screenshots included (U01–U05, U09–U10, U17–U20, N01–N04, S01–S06) |
+| Live sandbox demo (`/demo`): sell, pay as a test buyer, check the chat, watch every step | Built and run locally against the sandbox (D01–D11). Needs the shared buyer account and a Render deploy |
 | `chat` graph and `policy_pack` | Done in Studio (C01–C16, U16, E06). No API endpoint yet; the PayPal notes wait for a person to verify them |
 | `dispute_defense` graph, approval screen, Bryntum board | Planned, 1–7 Nov |
 | Evaluation set, published numbers, demo video | Planned, 8–12 Nov |
 
 ## Trust boundaries
 
-Everything that comes from the buyer (chat, email, screenshot, dispute messages) is **untrusted data**. The LLM has **no credentials and no tools**. Only the `execute_action` node writes to PayPal, and only after the seller approves.
+Everything that comes from the buyer (chat, email, screenshot, dispute messages) is **untrusted data**. The LLM has **no credentials and no tools**. Only the `execute_action` node writes to PayPal, and only after the seller approves. The one exception is the live demo (`DEMO_MODE`, sandbox only): code outside the graphs creates and captures orders there, to play the buyer's purchase.
 
 ```
 Seller UI ──► FastAPI (Render) ──► LangGraph ──► PayPal REST APIs
@@ -204,10 +205,26 @@ Fields in the LangGraph state are owned by the node that writes them (an `@owns(
 - The region is set once, in `REGION`.
 - No PayPal US page says refunds must go only through PayPal, so the refund note says only how to refund in PayPal. Response deadlines are given only where a US Help Center page states them (10 days for a dispute). Seller Protection depends on region, and for the demo it assumes a US sandbox business account. It does not cover "Significantly Not as Described", so the agent never promises protection on a SNAD dispute.
 
+## Live sandbox demo (`/demo`)
+
+A public page where anyone can try Vendor Guard against PayPal's sandbox, and see what it does:
+
+1. **Make a sale**: an item and a price in USD (1–1 000).
+2. **Pay as the test buyer**: PayPal's own checkout (JS SDK) with a shared sandbox buyer account, whose email and password the page shows. The server creates the order and captures it after approval.
+3. **Check the buyer's chat**: start from an honest buyer, an overpayment, a fake PayPal email or a prompt injection, edit it, or add a screenshot.
+
+Next to the steps, a live panel shows each `scam_check` node as it runs and what it wrote, every PayPal call with its HTTP status and response body, and the verified webhooks about the tester's sales. The panel shows the tester what they sent (the cleaned chat, the screenshot's text, the quotes), which `/scam-check` never returns.
+
+- **Anonymous sessions.** The page keeps the session id in `sessionStorage`, so closing the tab forgets it and a reload keeps it. "End demo" deletes the session at once, and a session idle for 30 minutes is deleted at the next new session or at boot. Deleting removes its sales, cases, claimed payments and the webhook events about its sales. The payments stay in PayPal's sandbox, which can't delete them.
+- **Limits per IP, per hour:** 10 checks (3 with a screenshot), 10 sales, 20 sessions. The same check limit applies to `/scam-check`. Counters are in memory, so they reset when Render sleeps.
+- **Off by default.** Only `DEMO_MODE=true` turns it on, and then the app refuses to start unless `PAYPAL_BASE_URL` is the sandbox and `DEMO_BUYER_EMAIL` and `DEMO_BUYER_PASSWORD` are set.
+- Order creation and capture are the app's only PayPal writes outside `execute_action`. They live in `app/demo.py`, never in a graph. A capture is sent with `PayPal-Request-Id: capture-<order id>`, so a retry can't capture twice, and only for an order of the caller's session.
+- Groq's free tier fits about 2 checks a minute in total. With several testers at once, checks fail closed (signals unknown, the fixed template) and the panel says so.
+
 ## Interface (planned)
 
 - **Dispute board** in Bryntum Scheduler: one row per open dispute, colored by graph state, with a diamond at `seller_response_due_date`. The agent adds an "approve by" block 48 h before the deadline, and `deadline_watch` turns anything under 24 h red. Board events are written by code from graph state, never by the LLM.
-- **Scam checker**: paste a chat or drop a screenshot, get the verdict with cited sentences.
+- **Scam checker**: paste a chat or drop a screenshot, get the verdict with cited sentences. Built for now as the demo page (`/demo`).
 - **Approval screen**: the draft, its evidence with IDs, and three buttons: approve, edit, reject.
 - FastAPI serves the pages and `GET /api/board`. Jinja2, HTMX and vanilla JS, no React.
 
@@ -217,7 +234,12 @@ Fields in the LangGraph state are owned by the node that writes them (an `@owns(
 |---|---|---|
 | `GET /healthz` | Built | `{"ok": true}` |
 | `POST /webhooks/paypal` | Built | `{"status": "stored"}` or `{"status": "duplicate"}`. 400 on invalid JSON or a bad signature. A 5xx if PayPal is unreachable, so PayPal retries. |
-| `POST /scam-check` | Built | Body `{text, image, expected_amount, expected_currency}`. Send `text`, `image` or both. `image` is a base64 PNG or JPEG with no `data:` prefix, up to 3 MB. The chat may be up to 8 000 chars after sanitising, counting the screenshot's text. Returns `{case_id, verdict, message, sentences, evidence, template, signals_checked, persisted}`, never the chat or the screenshot's text. 422 on bad input or a screenshot that can't be read, 503 when two checks are already running. Not authenticated yet (RECHECK #3). |
+| `POST /scam-check` | Built | Body `{text, image, expected_amount, expected_currency}`. Send `text`, `image` or both. `image` is a base64 PNG or JPEG with no `data:` prefix, up to 3 MB. The chat may be up to 8 000 chars after sanitising, counting the screenshot's text. Returns `{case_id, verdict, message, sentences, evidence, template, signals_checked, persisted}`, never the chat or the screenshot's text. 422 on bad input or a screenshot that can't be read, 429 over 10 checks (3 with a screenshot) an hour per IP, 503 when two checks are already running. Not authenticated yet (RECHECK #3). |
+| `GET /demo` | Built, `DEMO_MODE` only | The demo page. Every `/demo*` route is 404 without `DEMO_MODE=true`. |
+| `POST /demo/api/session` | Built, `DEMO_MODE` only | `{session_id, client_id, currency, buyer_email, buyer_password}`. The other demo routes need the id in `X-Demo-Session`, and answer 401 once the session ended or went idle. |
+| `POST /demo/api/orders`, `POST /demo/api/orders/{id}/capture` | Built, `DEMO_MODE` only | Create a USD order for `{item, amount}`, then capture it: `{capture_id, status, amount, currency}`. 404 for another session's order, 502 when PayPal refuses. |
+| `POST /demo/api/check` | Built, `DEMO_MODE` only | The `/scam-check` body. Streams NDJSON lines: `paypal` (method, path, status, body), `node` (name, update), then `result` (as `/scam-check`) or `error`. |
+| `GET /demo/api/state`, `POST /demo/api/end` | Built, `DEMO_MODE` only | The session's sales and the webhook events about them; ending deletes the session and all it left. |
 | `POST /disputes/{id}/decision` | Planned | Approve, edit or reject a draft |
 | `GET /api/board` | Planned | Only the authenticated seller's disputes, with no buyer messages or contacts |
 
@@ -230,15 +252,18 @@ Fields in the LangGraph state are owned by the node that writes them (an `@owns(
 ## Layout
 
 ```
-app/main.py         FastAPI app, /healthz, /webhooks/paypal, /scam-check
+app/main.py         FastAPI app, /healthz, /webhooks/paypal, /scam-check, the demo's streamed check
+app/demo.py         the live demo's routes: anonymous session, sandbox orders and captures, state, end
+app/ratelimit.py    per-IP hourly limits for the open endpoints
+app/static/demo.html  the demo page: plain HTML, CSS and JS, no build
 app/paypal.py       signature-header checks, OAuth token cache, verify-webhook-signature, capture and Transaction Search lookups
-app/db.py           schema bootstrap, claim_event() (idempotent insert), save_case()
+app/db.py           schema bootstrap, claim_event() (idempotent insert), save_case(), the demo's tables and cleanup
 app/scam_check.py   the scam_check graph: @owns, sanitize, the 10 nodes, verdict table, policy texts
 app/chat.py         the chat graph: route_in, classify, the check flow, the Tavily search
 app/policy_pack.py  the notes the chat shows: Vendor Guard's and PayPal's, with sources and `verified`
 app/output_guardrails.py  Sentence model, validate() and render() for LLM-written sentences
 app/llm.py          the Groq calls, no tools: ask() with a strict JSON schema, read_image() for screenshots
-tests/              pytest + respx (PayPal and Groq are mocked, no database needed)
+tests/              pytest + respx (PayPal and Groq are mocked, no database needed); tests/test_db.py runs the real SQL
 langgraph.json      serves the scam_check and chat graphs to `langgraph dev` and LangGraph Studio
 render.yaml         Render blueprint: web service + free Postgres
 ```
@@ -271,6 +296,8 @@ Copy `.env.example` to `.env` (it is gitignored).
 | `GROQ_API_KEY` | From console.groq.com. Required: the app does not start without it. The free tier (8K tokens/min) fits about 2 checks a minute. |
 | `LLM_MODEL` | Defaults to `openai/gpt-oss-120b`. Must be a Groq model with strict JSON-schema output. |
 | `TAVILY_API_KEY` | From app.tavily.com. Optional: without it the app starts, and a chat question with no note gets PayPal's help link. Turn off "Allow Use of Query Data" in the Tavily account (see Graph 3). |
+| `DEMO_MODE` | `true` turns on the live demo (`/demo`). Sandbox only: the app refuses to start with it against live PayPal. Off when unset. |
+| `DEMO_BUYER_EMAIL`, `DEMO_BUYER_PASSWORD` | A US sandbox personal account that testers log in with at PayPal's checkout. The page shows both. Required with `DEMO_MODE`. Keep a second account ready: a tester can change this one's password. |
 | `VISION_MODEL` | Defaults to `qwen/qwen3.8-27b`, which reads screenshots. Must be a Groq model with image input that accepts `reasoning_effort="none"`. It is a preview model and can be withdrawn at short notice. A screenshot costs about 2 000 tokens of its own per-minute limit, separate from `LLM_MODEL`'s. |
 
 Set `LANGSMITH_TRACING=true` only while testing with made-up chats: it sends every chat and LLM reply to LangSmith. Never set it on Render or with real cases. For `/scam-check` to find payments by ID, tick "Transaction Search" on the sandbox REST app. A new permission can take up to 9 hours to reach new tokens.
@@ -336,6 +363,7 @@ The plan has 61 test cases in six layers, plus C01–C16 for the chat, tracked b
 | Sandbox | G01–G12 | End to end on PayPal Sandbox, including resume after restart | manual scripts |
 | Security | S01–S11 | Prompt injection, forged webhooks, token replay, no tools on LLM nodes | pytest + promptfoo |
 | Chat | C01–C16 | `app/chat.py`: routing, the check flow, Tavily, links, personal data | CI, Groq and Tavily mocked |
+| Demo | D01–D11 | `/demo`: off by default, sandbox only, sessions, orders, the streamed check, per-IP limits | CI, PayPal and Groq mocked |
 | Evaluation | E01–E05 | 60 labelled chats, 20 sandbox disputes, 30 injection variants, 50 drafts | scripts + RAGAS |
 | Spike | P01–P02 | Which payment source feeds the ledger, and whether simulator events verify | manual |
 
@@ -357,8 +385,16 @@ The plan has 61 test cases in six layers, plus C01–C16 for the chat, tracked b
   - Pasted chats, the tag injection, the link filter, Tavily failures, personal data in the search, one Groq request per message, no tools or secrets.
   - U16: the `policy_pack` sources, and that unverified notes are never offered or shown.
   - E06 (tests/test_eval_classify_chat.py, `pytest -m eval -s`): the 39 cases in tests/chat_dataset.jsonl, all in English, the real Groq model. Each run saves every reply and the KPIs (routing, intent, notes shown, LLM calls) to tests/eval_results/, which git ignores. Each call uses about 830–890 tokens, about 1,600 for a dispute. No SDK retries, as in the app: a 429 waits 60 s and tries once more.
+- Demo (tests/test_demo.py): D01–D11. The routes are 404 when off, the app won't start against live PayPal, another session's order is never captured, the stream lists every node and PayPal call (no token) and ends with the same verdict as `/scam-check`, a busy check is an error line and every check gives its slot back, and the per-IP limits ignore forged `X-Forwarded-For` entries.
 
-The tests mock PayPal and Groq and replace the database calls, so they need neither credentials nor Postgres. They do not exercise the real SQL in `db.claim_event` or `db.save_case` (see RECHECK #7). Test IDs follow this README's grouping; there is no separate test-plan document.
+The tests mock PayPal and Groq and replace the database calls, so they need neither credentials nor Postgres. `tests/test_db.py` runs the real SQL (the claims, saving a case, the demo's tables and its cleanup) against a throwaway Postgres, and is skipped unless `TEST_DATABASE_URL` is set:
+
+```sh
+docker run -d --rm --name vg-test-pg -e POSTGRES_PASSWORD=test -p 55432:5432 postgres
+TEST_DATABASE_URL=postgresql://postgres:test@localhost:55432/postgres pytest tests/test_db.py
+```
+
+Test IDs follow this README's grouping; there is no separate test-plan document.
 
 ## Build order
 
@@ -371,4 +407,4 @@ The tests mock PayPal and Groq and replace the database calls, so they need neit
 
 ## Deploy
 
-`render.yaml` defines the web service and a free Postgres. Set `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`, `GROQ_API_KEY` and, optionally, `TAVILY_API_KEY` in the Render dashboard (they are `sync: false`). Dispute creation, `require-evidence` and `adjudicate` exist only in the sandbox. Always check a dispute's HATEOAS links before calling an action.
+`render.yaml` defines the web service and a free Postgres. Set `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`, `GROQ_API_KEY` and, optionally, `TAVILY_API_KEY` in the Render dashboard (they are `sync: false`). For the live demo, also set `DEMO_MODE=true`, `DEMO_BUYER_EMAIL` and `DEMO_BUYER_PASSWORD`, and subscribe the webhook to `PAYMENT.CAPTURE.*` and `CHECKOUT.ORDER.APPROVED` (and `CUSTOMER.DISPUTE.*` for later). Dispute creation, `require-evidence` and `adjudicate` exist only in the sandbox. Always check a dispute's HATEOAS links before calling an action.

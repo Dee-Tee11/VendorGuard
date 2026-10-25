@@ -25,10 +25,19 @@ Authentication and authorization are still being built, so some of these may no 
   *2026-10-20:* `/scam-check` adds a bigger target: each call costs 2 Groq calls and up to 6 PayPal calls. It now has a global limit of 2 concurrent checks (503 above that), and `/healthz` is `async`, so it no longer waits for a pool thread. Body size and per-caller rate limits are still open.
   *2026-10-21:* screenshots make a normal body up to about 4 MB, and a screenshot adds a third Groq call. The 3 MB image cap is checked only after the whole body has been read, so the body-size cap matters more now.
   *2026-10-22:* the image is now capped as base64, before it is decoded. The whole body is still read and parsed as JSON first, whatever its size.
+  *2026-10-24:* `/scam-check` and the demo now have per-IP hourly limits (`app/ratelimit.py`), in memory. The body-size cap is still open.
 
 - [ ] **18. Screenshots go to Groq with their metadata.** [app/llm.py](app/llm.py)
   Added 2026-10-21 with the screenshot input, not from the review. The image bytes are sent as uploaded. A phone photo of a screen can carry EXIF data (GPS position, device), and so can a JPEG. With `LANGSMITH_TRACING=true` the image is also stored in the traces.
   *Fix:* before real cases, re-encode the image without metadata (Pillow would then be a runtime dependency), or reject images that carry EXIF.
+
+- [ ] **23. The per-IP limit trusts the last `X-Forwarded-For` entry.** [app/ratelimit.py](app/ratelimit.py)
+  Added 2026-10-24 with the live demo. `client_ip()` takes the last entry, assuming Render's proxy appends the caller's address after anything the caller sent. Not checked on Render. If Render puts another proxy in front, the last entry could be that proxy, and every tester would share one limit. If it doesn't append at all, a caller could forge its address.
+  *Fix:* on the first deploy, send `curl -H "X-Forwarded-For: 1.2.3.4" https://<app>/demo/api/session` a few times and log what `client_ip()` sees. Then fix the rule in `client_ip()` only.
+
+- [ ] **24. Ending a demo session during a check can leave rows behind.** [app/db.py](app/db.py)
+  Added 2026-10-24. If "End demo" runs while a check of the same session is running, the session's `demo_cases` row is deleted first, and the check then saves its `scam_cases` and `claimed_payments` rows, which nothing deletes. They hold no chat and no quotes.
+  *Fix:* if it matters, sweep `scam_cases` and `claimed_payments` rows whose case has no session, or let `/demo/api/end` wait for the session's running check.
 
 ## LLM output
 
@@ -36,6 +45,10 @@ Authentication and authorization are still being built, so some of these may no 
   Found by the eval `verified, signals unknown` on 2026-10-21, not by the review. When `detect_signals` fails, `signals` is `None` and the verdict is `VERIFIED_WITH_WARNINGS`, but `_explain_input` never says the chat check failed. The model then cites an `E2` that does not exist ("A warning sign labeled {{E2.label}} could not be verified"). The guardrails reject it, so it is safe, but the seller gets the template instead of an explanation.
   *Fix:* when `signals is None`, add a line such as "Chat check: could not be done" to `_explain_input`, so the model can write an `ADMIT_MISSING` sentence on `E1`. Then remove the `xfail` on that eval case.
   *Next:* build a LangSmith dataset from the eval cases and score the explanations with an LLM-as-judge (does each sentence match the evidence and verdict?). The current evals only check the rules in `output_guardrails`, not whether the wording is true.
+
+- [ ] **25. The explanation reads badly around signal labels.** [app/scam_check.py](app/scam_check.py)
+  Added 2026-10-24, from a live run of the demo's fake-email chat. The labels are verb phrases written for "the buyer …" ("offers an email or screenshot as proof…"), and the model put them where a noun goes: "The buyer provides FAKE_PAYMENT_PROOF which is a offers an email…", "The communication includes a says the money is released only after…". The guardrails pass it (it is grounded), so the seller sees it. It also wrote "PayPal shows the payment status as UNAVAILABLE" when Transaction Search answered 403, which reads as if the payment itself were unavailable.
+  *Fix:* a graph change, so plan it first: either tell `EXPLAIN_PROMPT` that `{{Ek.label}}` follows "the buyer", or give each signal a noun-phrase label for the LLM. Then add an eval case that checks the wording, as #15's *Next* suggests.
 
 - [ ] **16. Nobody measures whether `detect_signals` catches real scams.** [app/scam_check.py:183](app/scam_check.py#L183)
   Added 2026-10-21, from a design discussion, not the review. The evals in `tests/test_eval_output_guardrails.py` only test the explanation. The signals never decide `VERIFIED` (PayPal does), but they decide `SCAM_LIKELY` and the warnings, and their recall and false-alarm rate are unknown.
@@ -64,9 +77,3 @@ Authentication and authorization are still being built, so some of these may no 
 - [ ] **22. Vendor Guard's own notes cite the README.** [app/policy_pack.py:17](app/policy_pack.py#L17)
   Added 2026-10-24, from the E06 eval. The `vg_*` notes end with "Source: README.md#graph-1-scam_check", which a seller can't open. A PayPal link would be a false source: these notes describe Vendor Guard's rules, not PayPal's.
   *Fix:* with the frontend, a page for the policy pack, such as `GET /help`, built from the same entries with one anchor per note, and `source_url="/help#<key>"`. Update the `README.md#` check in `tests/test_chat.py`. Also move the "different transaction IDs" sentence out of `vg_why_wait`, so `pp_different_ids` answers it with PayPal's link.
-
-## Tests
-
-- [ ] **7. Tests don't cover the real SQL.** [tests/test_webhook.py:50](tests/test_webhook.py#L50)
-  `test_u12` uses a hand-written fake `claim`, so a bug in `ON CONFLICT DO NOTHING`, the `rowcount == 1` check or the schema would pass. The same goes for `claim_payment` and `save_case`.
-  *Fix:* add a real-Postgres test, skipped when no database is reachable.

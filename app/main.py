@@ -1,6 +1,8 @@
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
+from contextvars import Context
 from decimal import Decimal
 from functools import partial
 
@@ -9,11 +11,14 @@ import binascii
 from typing import Annotated
 
 import anyio
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import AfterValidator, BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
-from app import db, llm, paypal, scam_check
+from app import db, demo, llm, paypal, ratelimit, scam_check
+
+log = logging.getLogger(__name__)
 
 
 REQUIRED_ENV = ("DATABASE_URL", "PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET", "PAYPAL_WEBHOOK_ID")
@@ -22,13 +27,19 @@ REQUIRED_ENV = ("DATABASE_URL", "PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET", "PAY
 @asynccontextmanager
 async def lifespan(_):
     # fail at boot, not on the first webhook: a missing value would otherwise pass /healthz and 500 every call
-    if missing := [k for k in REQUIRED_ENV if not os.getenv(k, "").strip()]:
+    required = REQUIRED_ENV + (demo.REQUIRED_ENV if demo.ENABLED else ())
+    if missing := [k for k in required if not os.getenv(k, "").strip()]:
         raise RuntimeError(f"missing env vars: {', '.join(missing)}")
+    if demo.ENABLED and ".sandbox." not in paypal.BASE:  # the demo pays with a shared account: never with real money
+        raise RuntimeError("DEMO_MODE needs PayPal's sandbox (PAYPAL_BASE_URL)")
     db.init()
+    if demo.ENABLED:
+        db.end_demo_sessions()  # sessions that went idle while the service slept
     yield
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(demo.router)
 
 
 @app.get("/healthz")
@@ -79,10 +90,16 @@ class ScamCheckIn(BaseModel):
 SCAM_LIMIT = anyio.CapacityLimiter(2)
 
 
-@app.post("/scam-check")
-async def scam_check_route(body: ScamCheckIn):
+def _admit(body: ScamCheckIn, request: Request) -> None:
+    """The checks before a scam check runs: 422 for a chat too long, 429 for a caller over its hourly limit."""
     if len(scam_check.sanitize(body.text)) > scam_check.MAX_CHARS:  # NFKC can make text longer
         raise HTTPException(422, "chat too long")
+    ratelimit.hit(request, "check", *(["screenshot"] if body.image else []))
+
+
+@app.post("/scam-check")
+async def scam_check_route(body: ScamCheckIn, request: Request):
+    _admit(body, request)
     try:
         SCAM_LIMIT.acquire_nowait()  # take the slot now: check-then-wait lets a whole burst through to queue
     except anyio.WouldBlock:
@@ -94,3 +111,55 @@ async def scam_check_route(body: ScamCheckIn):
         raise HTTPException(422, str(e))
     finally:
         SCAM_LIMIT.release()
+
+
+def _line(kind: str, **fields) -> bytes:
+    return (json.dumps({"type": kind, **fields}, default=lambda o: o.model_dump() if isinstance(o, BaseModel) else str(o))
+            + "\n").encode()
+
+
+async def _stream_check(body: ScamCheckIn, session_id: str):
+    """The demo's check, as NDJSON: each PayPal call and each node's update as it happens, then the result.
+
+    Shows the tester what they sent (the sanitized chat, the screenshot's text, the quotes), which /scam-check never
+    returns. The slot is taken here, not in the route: a generator that never starts would never release it.
+    """
+    try:
+        SCAM_LIMIT.acquire_nowait()
+    except anyio.WouldBlock:
+        yield _line("error", message="busy, try again in a moment")
+        return
+    try:
+        calls = []
+        # every step runs in this one context: Starlette would run each next() in a fresh copy, losing the trace
+        ctx = Context()
+        ctx.run(paypal.trace.set, calls)
+        inputs = {"text": body.text, "image": body.image, "expected_amount": str(body.expected_amount),
+                  "expected_currency": body.expected_currency}
+        steps = ctx.run(scam_check.graph.stream, inputs, stream_mode=["updates", "values"])
+        final = None
+        while (step := await anyio.to_thread.run_sync(ctx.run, next, steps, None)) is not None:
+            mode, chunk = step
+            while calls:  # the calls a node made come before its update
+                yield _line("paypal", **calls.pop(0))
+            if mode == "values":
+                final = chunk
+                continue
+            for node, update in chunk.items():
+                if node == "ingest_input":  # stored first, so ending the session deletes this case too
+                    await anyio.to_thread.run_sync(db.add_demo_case, session_id, update["case_id"])
+                yield _line("node", node=node, update=update or {})
+        yield _line("result", **scam_check.result(final), persisted=final["persisted"])
+    except scam_check.Unreadable as e:
+        yield _line("error", message=str(e))
+    except Exception as e:
+        log.warning("demo check failed: %s", type(e).__name__)
+        yield _line("error", message="the check could not run, try again")
+    finally:
+        SCAM_LIMIT.release()
+
+
+@app.post("/demo/api/check", dependencies=[Depends(demo.enabled)])
+def demo_check(body: ScamCheckIn, request: Request, session_id: str = Depends(demo.session)):
+    _admit(body, request)
+    return StreamingResponse(_stream_check(body, session_id), media_type="application/x-ndjson")

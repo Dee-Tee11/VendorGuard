@@ -3,6 +3,7 @@ import os
 import re
 import threading
 import time
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -14,6 +15,9 @@ SIG_HEADERS = ("auth-algo", "cert-url", "transmission-id", "transmission-sig", "
 _http = httpx.Client(timeout=10)  # one client: reuses TLS connections instead of a handshake per call
 _token = {"value": None, "exp": 0.0}
 _token_lock = threading.Lock()
+# set by the demo's live panel: each call's method, path, status and response body. Never headers or the token
+trace: ContextVar[list | None] = ContextVar("paypal_trace", default=None)
+TRACE_BODY = 4000  # chars of JSON per call; a bigger body is shown cut, as text
 
 
 def access_token(stale: str | None = None) -> str:
@@ -55,8 +59,23 @@ def _call(method: str, path: str, headers: dict | None = None, **kwargs) -> http
         r = _http.request(method, f"{BASE}{path}", headers={"Authorization": f"Bearer {token}", **(headers or {})},
                           **kwargs)
         if r.status_code != 401 or attempt == 2:
-            return r
+            break
         token = access_token(stale=token)
+    if (calls := trace.get()) is not None:
+        calls.append({"method": method, "path": path, "params": kwargs.get("params"), "status": r.status_code,
+                      "body": _traced_body(r)})
+    return r
+
+
+def _traced_body(r: httpx.Response):
+    try:
+        body = r.json()
+    except ValueError:
+        return r.text[:TRACE_BODY]
+    if isinstance(body, dict):
+        body.pop("links", None)  # HATEOAS links: long and not evidence
+    text = json.dumps(body)
+    return body if len(text) <= TRACE_BODY else text[:TRACE_BODY] + "…"
 
 
 def get_capture(capture_id: str) -> dict | None:

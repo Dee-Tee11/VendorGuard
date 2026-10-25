@@ -22,3 +22,9 @@ services:
         value: https://api-m.sandbox.paypal.com
       - key: GROQ_API_KEY # required: the app does not start without it
         sync: false
+      - key: DEMO_MODE # true: the live demo at /demo (sandbox only)
+        value: "false"
+      - key: DEMO_BUYER_EMAIL # the shared US sandbox buyer; required with DEMO_MODE
+        sync: false
+      - key: DEMO_BUYER_PASSWORD
+        sync: false

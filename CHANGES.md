@@ -1,5 +1,37 @@
 # Changes
 
+## 2026-10-24: live sandbox demo (`/demo`)
+
+**What it is** ([app/demo.py](app/demo.py), [app/static/demo.html](app/static/demo.html), README "Live sandbox demo")
+- A public page where a tester:
+  1. makes a sale,
+  2. pays it in PayPal's real sandbox checkout with a shared test buyer,
+  3. checks a buyer's chat.
+- A live panel shows every `scam_check` node, every PayPal call with its status and body, and the verified webhooks about the tester's sales.
+- Off unless `DEMO_MODE=true`, and then the app refuses to start against live PayPal or without `DEMO_BUYER_EMAIL` and `DEMO_BUYER_PASSWORD`.
+- No graph changed: the git diff of `app/scam_check.py` and `app/chat.py` is empty.
+
+**Sessions.** Anonymous. The page keeps the session id in `sessionStorage`, so closing the tab forgets it and a reload keeps it. "End demo" deletes the session at once, and an idle one is deleted 30 minutes later, at the next new session or at boot. Deleting removes its sales, cases, claimed payments and the webhook events about its sales, in one transaction. The sessions live in Postgres, not memory, because Render's free tier sleeps.
+
+**PayPal writes.** Creating and capturing orders are the app's first PayPal writes. They live in `app/demo.py`, outside the graphs, and play the buyer's purchase. A capture:
+- uses `PayPal-Request-Id: capture-<order id>`, so a retry can't capture twice;
+- only goes through for an order of the caller's own session.
+
+**Live panel.** `paypal._call` records each call in a context variable (`paypal.trace`), never headers or the token. `POST /demo/api/check` streams NDJSON from `graph.stream`. Every step runs in one `contextvars.Context`, because Starlette runs each step of a generator in a fresh copy and the trace would be lost. The check slot is taken inside the stream, so a stream that never starts can't keep it.
+
+**Per-IP limits** ([app/ratelimit.py](app/ratelimit.py)). Per hour: 10 checks (3 with a screenshot), 10 sales, 20 sessions. The check limit applies to `/scam-check` too. A refused call counts for nothing. The counters are in memory. Which `X-Forwarded-For` entry is the caller on Render is not checked yet (RECHECK #23).
+
+**Tests**
+- D01–D11 in `tests/test_demo.py` (16 tests, 243 offline in total).
+- `tests/test_db.py` runs the real SQL against a throwaway Postgres: the demo's tables and cleanup, `claim_event`, `claim_payment` and `save_case`. This closes RECHECK #7.
+
+**Run for real** (locally, against the sandbox and Groq, with a throwaway Postgres)
+- The fake-email and injection chats both gave `WAIT`. Ending the session deleted its rows, and the session then got 401. Phone width has no horizontal scroll.
+- Transaction Search answered 403 `NOT_AUTHORIZED`: "Transaction Search" is still not ticked on the sandbox REST app. Until it is, an ID that isn't a capture of this account is "unavailable", never "not found", so the demo can't reach `SCAM_LIKELY`.
+- The first fake-email chat put the signals in a pasted email, and only `URGENCY_PRESSURE` counted, because `detect_signals` counts only what the buyer says. The scenario now has the buyer say it, and all 3 signals are found.
+- The explanation reads badly around signal labels (RECHECK #25). That is a graph change, so it is not fixed here.
+- Not yet run: a payment through the PayPal button. It needs the real shared buyer account.
+
 ## 2026-10-24: E06 fixes from `/code-review`, and `not_paypal`
 
 - New intent `not_paypal`: a check or dispute that isn't on PayPal (a bank transfer, Zelle, an eBay case) gets "Vendor Guard only works with PayPal…" from the `other` node, instead of the intro. Before, the `other` rule ("anything not about PayPal") could send these to the intro with no word on why. Three new E06 cases cover it.

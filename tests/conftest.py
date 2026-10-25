@@ -15,7 +15,7 @@ os.environ.update(
     GROQ_API_KEY="gsk_CANARY",  # app.llm builds its client at import, so this must be set first
 )
 
-from app import db, paypal  # noqa: E402
+from app import db, paypal, ratelimit  # noqa: E402
 
 BEARER = "A21AA-CANARY"
 
@@ -23,6 +23,11 @@ BEARER = "A21AA-CANARY"
 @pytest.fixture(autouse=True)
 def fresh_token():
     paypal._token.update(value=None, exp=0.0)
+
+
+@pytest.fixture(autouse=True)
+def fresh_limits():
+    ratelimit._hits.clear()  # every test client calls from the same address
 
 
 @pytest.fixture
