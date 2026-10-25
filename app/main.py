@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import Context
 from decimal import Decimal
 from functools import partial
@@ -69,11 +69,14 @@ def _b64(v: str) -> bytes:
         raise ValueError("the screenshot must be plain base64, with no data: prefix")
 
 
+# capped as base64, before decoding: 4 MB of base64 is 3 MB of image, the cap older Groq docs gave for a base64
+# image (Groq took 3.06 MB on 2026-10-21); a phone screenshot is far smaller
+Screenshot = Annotated[str, Field(max_length=4_000_000), AfterValidator(_b64)]
+
+
 class ScamCheckIn(BaseModel):
     text: str = Field("", max_length=scam_check.MAX_CHARS)
-    # capped as base64, before decoding: 4 MB of base64 is 3 MB of image, the cap older Groq docs gave for a base64
-    # image (Groq took 3.06 MB on 2026-10-21); a phone screenshot is far smaller
-    image: Annotated[str, Field(max_length=4_000_000), AfterValidator(_b64)] | None = None
+    image: Screenshot | None = None
     expected_amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)  # the seller's price, never the buyer's
     expected_currency: str = Field(pattern=r"^[A-Z]{3}$")
 
@@ -97,20 +100,28 @@ def _admit(body: ScamCheckIn, request: Request) -> None:
     ratelimit.hit(request, "check", *(["screenshot"] if body.image else []))
 
 
-@app.post("/scam-check")
-async def scam_check_route(body: ScamCheckIn, request: Request):
-    _admit(body, request)
+@contextmanager
+def _slot():
+    """One of SCAM_LIMIT's slots for a check, or 503 when none is free."""
     try:
         SCAM_LIMIT.acquire_nowait()  # take the slot now: check-then-wait lets a whole burst through to queue
     except anyio.WouldBlock:
         raise HTTPException(503, "busy, try again")
     try:
-        run = partial(scam_check.run, body.text, str(body.expected_amount), body.expected_currency, body.image)
-        return await anyio.to_thread.run_sync(run)
-    except scam_check.Unreadable as e:
-        raise HTTPException(422, str(e))
+        yield
     finally:
         SCAM_LIMIT.release()
+
+
+@app.post("/scam-check")
+async def scam_check_route(body: ScamCheckIn, request: Request):
+    _admit(body, request)
+    with _slot():
+        try:
+            run = partial(scam_check.run, body.text, str(body.expected_amount), body.expected_currency, body.image)
+            return await anyio.to_thread.run_sync(run)
+        except scam_check.Unreadable as e:
+            raise HTTPException(422, str(e))
 
 
 def _line(kind: str, **fields) -> bytes:
@@ -163,3 +174,27 @@ async def _stream_check(body: ScamCheckIn, session_id: str):
 def demo_check(body: ScamCheckIn, request: Request, session_id: str = Depends(demo.session)):
     _admit(body, request)
     return StreamingResponse(_stream_check(body, session_id), media_type="application/x-ndjson")
+
+
+class ChatIn(BaseModel):
+    message: str = Field("", max_length=scam_check.MAX_CHARS)
+    image: Screenshot | None = None  # the buyer's chat as a screenshot, read only by the check
+
+    @model_validator(mode="after")
+    def _message_or_image(self):
+        if not self.message and self.image is None:
+            raise ValueError("send a message, a screenshot, or both")
+        if self.image is not None and not llm.image_type(self.image):
+            raise ValueError("the screenshot must be a PNG or JPEG")
+        return self
+
+
+@app.post("/demo/api/chat", dependencies=[Depends(demo.enabled)])
+async def demo_chat(body: ChatIn, request: Request, session_id: str = Depends(demo.turn, scope="function")):
+    """One message to the chat graph. A message that runs a scam check (the buyer's chat, after the price) counts as
+    a check and takes a slot, as chat.runs_scam_check asks. demo.turn runs one message at a time per session, so the
+    thread can't change between that decision and the turn."""
+    runs_check = await anyio.to_thread.run_sync(demo.runs_check, session_id, body.message, body.image)
+    ratelimit.hit(request, "message", *((["check"] + (["screenshot"] if body.image else [])) if runs_check else []))
+    with _slot() if runs_check else nullcontext():
+        return await anyio.to_thread.run_sync(demo.chat_turn, session_id, body.message, body.image)

@@ -1,4 +1,5 @@
 """The chat graph, offline: Groq stubbed like llm_stub, Tavily and PayPal mocked with respx. IDs are in the README."""
+import base64
 import importlib
 import json
 from datetime import date
@@ -11,7 +12,7 @@ from pydantic import ValidationError
 
 from app import chat, llm, policy_pack, scam_check
 from tests.test_scam_check import (  # noqa: F401  (claimed is an autouse fixture, llm_stub a fixture)
-    GROQ, PAID, SCAM_CHAT, TID, TWO_SIGNALS, capture, claimed, completion, llm_stub, search,
+    GROQ, PAID, PNG, SCAM_CHAT, TID, TWO_SIGNALS, capture, claimed, completion, llm_stub, search,
 )
 
 FAKE_RESULT = {"case_id": "c1", "verdict": "WAIT", "message": scam_check.POLICY["P.WAIT_NOT_CONFIRMED"],
@@ -86,6 +87,12 @@ def unverify(monkeypatch, *keys):
 US = policy_pack.PAYPAL_PAGES + "cshelp/article/x-help1"
 
 
+def shot(text="", image=PNG, kind="png"):
+    """A message with a screenshot, as the demo sends it: a text part and a base64 data: URL."""
+    url = f"data:image/{kind};base64,{base64.b64encode(image).decode()}"
+    return [{"type": "text", "text": text}, {"type": "image_url", "image_url": {"url": url}}]
+
+
 def test_c01_question_with_a_note_shows_it_word_for_word(choice, talk):
     choice.intent, choice.entries = "question", ["vg_why_wait"]
     entry = policy_pack.POLICY_PACK["vg_why_wait"]
@@ -109,7 +116,13 @@ def test_c01_dispute_shows_the_fixed_text_and_verified_dispute_notes(choice, tal
 def test_c01_other_is_the_intro(choice, talk):
     reply = talk("Hi, I am Amanda and I have a few questions regarding a possible scam, can you help me?")
     assert reply.startswith(chat.INTRO) and policy_pack.POLICY_PACK["vg_how_to_check"]["text"] in reply
-    assert all(e["title"] in reply for e in policy_pack.verified().values())
+    assert "Notes I have" not in reply
+
+
+def test_c01_notes_lists_the_note_titles_without_the_llm(choice, talk):
+    reply = talk(" Notes ")
+    assert reply.startswith("Notes I have: ") and all(e["title"] in reply for e in policy_pack.verified().values())
+    assert not choice.calls
 
 
 def test_c01_not_paypal_says_only_paypal(choice, talk, tavily):
@@ -125,7 +138,7 @@ def test_c02_the_check_sends_the_chat_unchanged_with_the_sellers_price(choice, t
     assert talk("check") == chat.ASK_PRICE
     assert talk("usd 25,5") == chat.ASK_CHAT
     reply = talk(ODD_CHAT)
-    assert ran == [(ODD_CHAT, "25.5", "USD")]
+    assert ran == [(ODD_CHAT, "25.5", "USD", None)]
     assert reply.startswith("WAIT: ") and "Case c1" in reply and "QUOTE-CANARY" not in reply
     assert not talk.state["awaiting"] and not talk.state["price"]
     assert choice.calls == [] and not tavily.called
@@ -186,8 +199,9 @@ def test_c06_the_result_has_no_quotes_and_scam_check_leaves_nothing_in_the_threa
 
 
 @pytest.mark.parametrize("text", [f"can you check {TID}?", "Buyer: I paid\nSeller: thanks", "a" * 401,
-                                  [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "x"}}]],
-                         ids=["an id", "chat labels", "too long", "an image"])
+                                  [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "x"}}],
+                                  shot("look")],
+                         ids=["an id", "chat labels", "too long", "an image", "a screenshot"])
 def test_c07_a_pasted_chat_starts_the_check_without_llm_or_tavily(choice, talk, tavily, text):
     assert talk(text) == chat.PASTED + chat.ASK_PRICE + chat.PASTE_AGAIN
     assert choice.calls == [] and not tavily.called and talk.state["awaiting"] == "price"
@@ -311,8 +325,11 @@ def test_c15_the_classify_request_has_no_tools_and_no_secrets(talk, api, monkeyp
 
 @pytest.mark.parametrize("text, reply", [("  \n​ ", chat.BAD_CHAT), ("a" * 8001, chat.BAD_CHAT),
                                          ("ﷺ" * 445, chat.BAD_CHAT),
-                                         ([{"type": "image_url", "image_url": {"url": "x"}}], chat.ONLY_TEXT)],
-                         ids=["empty", "too long", "too long after NFKC", "an image"])
+                                         ([{"type": "image_url", "image_url": {"url": "x"}}], chat.ONLY_TEXT),
+                                         (shot(image=b"GIF89a"), chat.ONLY_TEXT), (shot(kind="gif"), chat.ONLY_TEXT),
+                                         (shot() + shot()[1:], chat.ONLY_TEXT)],
+                         ids=["empty", "too long", "too long after NFKC", "an image", "a gif", "a gif's url",
+                              "two screenshots"])
 def test_c16_a_bad_chat_is_asked_again(choice, talk, ran, text, reply):
     talk("check")
     talk("25.00 USD")
@@ -375,3 +392,21 @@ def test_u16_classify_keeps_up_to_three_verified_entries(choice, talk, tavily, m
     choice.entries = ["pp_friends_and_family", "vg_verdicts", "vg_verdicts", "vg_why_wait", "vg_extra", "vg_how_to_check"]
     talk("what does WAIT mean?")
     assert talk.state["entries"] == ["vg_verdicts", "vg_why_wait", "vg_extra"]
+
+
+def test_c17_a_screenshot_at_the_chat_step_runs_the_check_with_it(choice, talk, ran):
+    talk("check")
+    talk("25.00 USD")
+    assert talk(shot()).startswith("WAIT: ")
+    assert ran == [("", "25.00", "USD", PNG)] and not talk.state["awaiting"] and choice.calls == []
+
+
+def test_c17_an_unreadable_screenshot_is_asked_again(choice, talk, monkeypatch):
+    def unreadable(*args):
+        raise scam_check.Unreadable("could not read the screenshot, try again or paste the chat as text")
+
+    monkeypatch.setattr(scam_check, "run", unreadable)
+    talk("check")
+    talk("25.00 USD")
+    assert talk(shot()) == "Could not read the screenshot, try again or paste the chat as text. Type cancel to stop."
+    assert talk.state["awaiting"] == "chat"

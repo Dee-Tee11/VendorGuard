@@ -1,12 +1,14 @@
 """The live demo, offline: PayPal mocked with respx, Groq stubbed like llm_stub, the demo tables replaced by a dict."""
+import base64
 import json
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import db, demo, main, paypal, ratelimit, scam_check
+from app import chat, db, demo, main, paypal, ratelimit, scam_check
 from tests.conftest import BEARER
+from tests.test_chat import choice  # noqa: F401  (a fixture)
 from tests.test_scam_check import (  # noqa: F401  (claimed is an autouse fixture, llm_stub a fixture)
     PAID, SCAM_CHAT, TID, TWO_SIGNALS, capture, claimed, llm_stub,
 )
@@ -28,7 +30,7 @@ def demo_db(monkeypatch):
     sessions = {}
     monkeypatch.setattr(db, "new_demo_session", lambda sid: sessions.setdefault(sid, {"sales": {}, "cases": []}))
     monkeypatch.setattr(db, "touch_demo_session", lambda sid: sid in sessions)
-    monkeypatch.setattr(db, "end_demo_sessions", lambda sid=None: sessions.pop(sid, None) if sid else None)
+    monkeypatch.setattr(db, "end_demo_sessions", lambda sid=None: [sid] if sid and sessions.pop(sid, None) else [])
     monkeypatch.setattr(db, "add_demo_sale", lambda sid, oid, item, amount: sessions[sid]["sales"].update(
         {oid: {"order_id": oid, "item": item, "amount": amount}}))
     monkeypatch.setattr(db, "demo_sale_exists", lambda sid, oid: oid in sessions[sid]["sales"])
@@ -50,7 +52,8 @@ def lines(r):
 
 
 def test_d01_off_by_default():
-    for method, path in [("GET", "/demo"), ("POST", "/demo/api/session"), ("POST", "/demo/api/check")]:
+    for method, path in [("GET", "/demo"), ("POST", "/demo/api/session"), ("POST", "/demo/api/check"),
+                         ("POST", "/demo/api/chat")]:
         assert client.request(method, path, json=CHECK).status_code == 404
 
 
@@ -171,3 +174,84 @@ def test_d11_three_screenshots_an_hour_per_ip(monkeypatch):
     assert [client.post("/scam-check", json=shot).status_code for _ in range(4)] == [200, 200, 200, 429]
     assert client.post("/scam-check", json=CHECK).status_code == 200  # the refused one counted for nothing
     assert len(ratelimit._hits[("testclient", "check")]) == 4
+
+
+def say(h, message):
+    return client.post("/demo/api/chat", json={"message": message}, headers=h)
+
+
+def test_d12_a_question_is_routed_and_answered_from_a_verified_note(demo_db, choice):
+    key = next(iter(chat.VERIFIED))
+    choice.intent, choice.entries = "question", [key]
+    r = say(start(), "What does WAIT mean?").json()
+    assert r["route"] == "question" and r["intent"] == "question" and r["notes"] == [key]
+    assert chat.VERIFIED[key]["text"] in r["reply"] and len(choice.calls) == 1
+
+
+def test_d13_the_chat_runs_a_check_over_three_messages_in_its_own_session(api, demo_db, choice):
+    capture(api, httpx.Response(200, json=USD_PAID))
+    h, other = start(), start("2.2.2.2")
+    assert say(h, "check").json() == {"reply": chat.ASK_PRICE, "route": "start_check", "intent": None, "notes": [],
+                                      "awaiting": "price"}
+    assert say(h, "45.00 USD").json()["awaiting"] == "chat"
+    r = say(h, PAID).json()
+    assert r["route"] == "check" and r["reply"].startswith("VERIFIED: ") and r["awaiting"] is None
+    case_id = r["reply"].rsplit("Case ", 1)[1]
+    assert demo_db[h["X-Demo-Session"]]["cases"] == [case_id]  # so ending the session deletes it
+    assert choice.calls == []  # the check flow never calls classify
+    assert say(other, "45.00 USD").json()["route"] != "check"  # another session's thread knows nothing of the price
+    assert len(ratelimit._hits[("1.1.1.1", "check")]) == 1  # the buyer's chat counted as a check
+
+
+def test_d14_the_message_that_runs_a_check_needs_a_free_slot(api, demo_db, choice, monkeypatch):
+    h = start()
+    say(h, "check")
+    say(h, "45.00 USD")
+    monkeypatch.setattr(main, "SCAM_LIMIT", Full())
+    assert say(h, PAID).status_code == 503
+    assert demo.runs_check(h["X-Demo-Session"], PAID)  # nothing ran: the chat can be sent again
+    assert say(h, " ").json()["reply"] == chat.BAD_CHAT  # check() runs no scam_check for it: no slot, not counted
+    assert say(start(), "hello").status_code == 200  # other messages don't need a slot
+    assert len(ratelimit._hits[("1.1.1.1", "check")]) == 1  # the chat refused for want of a slot, not the blank one
+
+
+def awaiting(h):
+    return demo.chat_graph.get_state(demo._thread(h["X-Demo-Session"])).values.get("awaiting")
+
+
+def test_d15_ending_or_sweeping_the_session_forgets_its_conversation(demo_db, choice, monkeypatch):
+    ended, idle = start(), start()
+    for h in (ended, idle):
+        say(h, "check")
+    assert awaiting(ended) == awaiting(idle) == "price"
+    client.post("/demo/api/end", headers=ended)
+    assert demo.chat_graph.get_state(demo._thread(ended["X-Demo-Session"])).values == {}
+    monkeypatch.setattr(db, "end_demo_sessions", lambda sid=None: [] if sid else [idle["X-Demo-Session"]])
+    start()  # sweeps the idle session
+    assert demo.chat_graph.get_state(demo._thread(idle["X-Demo-Session"])).values == {}
+
+
+def test_d16_a_session_takes_one_message_at_a_time(demo_db, choice):
+    h = start()
+    demo._busy.add(h["X-Demo-Session"])  # a message still running
+    assert say(h, "hello").status_code == 409
+    assert client.post("/demo/api/end", headers=h).status_code == 409  # can't delete the thread under it
+    demo._busy.discard(h["X-Demo-Session"])
+    assert say(h, "hello").status_code == 200 and say(h, "hello").status_code == 200  # given back every time
+    assert client.post("/demo/api/end", headers=h).status_code == 200 and not demo._busy
+    assert say(h, "hello").status_code == 401
+
+
+def test_d17_a_screenshot_in_the_chat_runs_the_check_and_counts_as_one(demo_db, choice, monkeypatch):
+    ran = []
+    monkeypatch.setattr(scam_check, "run", lambda *args: ran.append(args) or {
+        "case_id": "c1", "verdict": "WAIT", "message": "m", "sentences": [], "persisted": True})
+    h, png = start(), "iVBORw0KGgoAAAAAAAAAAA=="
+    early = client.post("/demo/api/chat", json={"message": "", "image": png}, headers=h).json()
+    assert early["route"] == "start_check" and not ran  # before the price: not read, not a check
+    say(h, "45.00 USD")
+    r = client.post("/demo/api/chat", json={"message": "", "image": png}, headers=h).json()
+    assert r["route"] == "check" and ran == [("", "45.00", "USD", base64.b64decode(png))]
+    assert [len(ratelimit._hits[("1.1.1.1", k)]) for k in ("check", "screenshot")] == [1, 1]
+    for bad in ({"message": ""}, {"message": "", "image": "R0lGODlhAQABAAAAACw="}, {"image": "data:image/png;base64,x"}):
+        assert client.post("/demo/api/chat", json=bad, headers=h).status_code == 422

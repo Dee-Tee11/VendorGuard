@@ -5,7 +5,7 @@ from collections import defaultdict, deque
 
 from fastapi import HTTPException, Request
 
-LIMITS = {"check": 10, "screenshot": 3, "sale": 10, "session": 20}  # per IP per WINDOW
+LIMITS = {"check": 10, "screenshot": 3, "sale": 10, "session": 20, "message": 30}  # per IP per WINDOW
 WINDOW = 3600.0
 # ponytail: in memory, one instance; resets when Render sleeps or restarts. Move to Postgres if it runs on several
 _hits: dict[tuple[str, str], deque] = defaultdict(deque)

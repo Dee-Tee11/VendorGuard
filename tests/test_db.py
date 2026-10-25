@@ -59,7 +59,7 @@ def test_ending_a_session_deletes_all_it_left_and_nothing_else():
     mine, other = demo_session(), demo_session()
     state = db.demo_state(mine[0])
     assert [s["capture_id"] for s in state["sales"]] == [mine[2]] and len(state["events"]) == 2
-    db.end_demo_sessions(mine[0])
+    assert db.end_demo_sessions(mine[0]) == [mine[0]]
     assert rows(*mine[1:]) == NONE and not db.touch_demo_session(mine[0])
     assert rows(*other[1:]) == ALL and db.touch_demo_session(other[0])
     db.end_demo_sessions(other[0])
@@ -70,7 +70,8 @@ def test_only_idle_sessions_are_swept():
     with db._connect() as c:
         c.execute("UPDATE demo_sessions SET last_seen = now() - interval '31 minutes' WHERE id = %s", (idle[0],))
     assert not db.touch_demo_session(idle[0])  # idle sessions can't be revived
-    db.end_demo_sessions()
+    swept = db.end_demo_sessions()
+    assert idle[0] in swept and active[0] not in swept
     assert rows(*idle[1:]) == NONE
     assert rows(*active[1:]) == ALL
     db.end_demo_sessions(active[0])

@@ -135,8 +135,9 @@ def demo_state(session_id: str) -> dict:
     }
 
 
-def end_demo_sessions(session_id: str | None = None) -> None:
-    """Deletes one session, or every idle one, with all it left: cases, claimed payments and webhook events."""
+def end_demo_sessions(session_id: str | None = None) -> list[str]:
+    """Deletes one session, or every idle one, with all it left: cases, claimed payments and webhook events.
+    Returns the ids it deleted."""
     with _connect() as c:  # one transaction: all of it goes, or none
         if session_id:
             ids = [session_id]
@@ -144,9 +145,10 @@ def end_demo_sessions(session_id: str | None = None) -> None:
             ids = [r[0] for r in c.execute("SELECT id FROM demo_sessions WHERE last_seen <= now() - %s::interval",
                                            (DEMO_IDLE,))]
         if not ids:
-            return
+            return []
         p = {"ids": ids}
         c.execute(f"DELETE FROM claimed_payments WHERE case_id IN ({CASE_IDS})", p)
         c.execute(f"DELETE FROM scam_cases WHERE id IN ({CASE_IDS})", p)
         c.execute(f"DELETE FROM webhook_events WHERE body->'resource'->>'id' IN ({SALE_IDS})", p)
-        c.execute("DELETE FROM demo_sessions WHERE id = ANY(%(ids)s)", p)  # cascades to demo_sales and demo_cases
+        gone = c.execute("DELETE FROM demo_sessions WHERE id = ANY(%(ids)s) RETURNING id", p)  # cascades to sales, cases
+        return [r[0] for r in gone]

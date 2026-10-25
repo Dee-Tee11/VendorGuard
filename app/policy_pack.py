@@ -47,7 +47,7 @@ POLICY_PACK = {
     "vg_how_to_check": _vg(
         "How to check a payment",
         "Say check. I'll ask for your price, for example 25.00 USD, and then for the buyer's chat: paste it exactly "
-        "as written. Type cancel to stop at any time. Screenshots aren't supported in this chat yet.",
+        "as written, or send a screenshot of it. Type cancel to stop at any time.",
         "graph-3-chat",
     ),
     "pp_different_ids": _pp(

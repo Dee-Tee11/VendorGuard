@@ -4,6 +4,8 @@ One LLM call per message picks closed choices: an intent and policy_pack keys. E
 here, by scam_check, or comes from PayPal (a title and a link). The buyer's chat goes to scam_check.run() as typed and
 never reaches this module's LLM call or Tavily. The price comes from the seller's own message, read by a regex.
 """
+import base64
+import binascii
 import contextvars
 import logging
 import os
@@ -22,8 +24,6 @@ log = logging.getLogger(__name__)
 TAVILY_URL = "https://api.tavily.com/search"
 # optional: without a key, a question with no note gets "I don't have that information" and PayPal's help link
 TAVILY_KEY = os.getenv("TAVILY_API_KEY", "").strip()
-if not TAVILY_KEY:
-    log.warning("TAVILY_API_KEY is not set: questions with no note get PayPal's help link only")
 MAX_QUESTION = 400  # longer messages are treated as a pasted chat; also an old hard limit of Tavily's query
 INTENTS = ("question", "scam_check", "dispute", "not_paypal", "other")
 DISPUTE_KEYS = ("pp_dispute_vs_claim", "pp_dispute_deadline", "pp_chargeback", "pp_snad_not_covered", "pp_proof_of_delivery")
@@ -63,17 +63,19 @@ PASTED = ("This looks like a buyer's chat, a screenshot or a payment ID, so I ha
           "I only read those inside a check. ")
 PASTE_AGAIN = (" Then paste the chat again. If it was a question, type cancel and ask it in under "
                f"{MAX_QUESTION} characters.")
-ASK_CHAT = "Now paste the buyer's chat exactly as written. It goes straight to the check. Type cancel to stop."
+ASK_CHAT = ("Now paste the buyer's chat exactly as written, or send a screenshot of it. It goes straight to the check. "
+            "Type cancel to stop.")
 BAD_PRICE = ("I need the amount and a 3-letter currency, for example 25.00 USD: more than 0, with up to 2 decimals. "
              "Type cancel to stop.")
-BAD_CHAT = f"Paste the buyer's chat as text, up to {MAX_CHARS} characters. Type cancel to stop."
+BAD_CHAT = (f"Paste the buyer's chat as text, up to {MAX_CHARS} characters, or send one PNG or JPEG screenshot of it. "
+            "Type cancel to stop.")
 ONLY_TEXT = "I can only read text here for now. Type cancel to stop."
 CANCELLED = "Check cancelled. Nothing was checked."
 CHECK_FAILED = "The check could not run. Say check to try again."
 DONT_KNOW = f"I don't have that information. PayPal's help for US businesses: {policy_pack.HELP_URL}"
 INTRO = ("Hi! I'm Vendor Guard, and I help PayPal sellers with three things:\n"
          "1. Questions about selling with PayPal: I answer from notes checked against PayPal's pages, "
-         "or point you to PayPal's own pages.\n"
+         "or point you to PayPal's own pages. Say notes to see the topics I have notes on.\n"
          "2. Checking a buyer's payment before you ship.\n"
          "3. Disputes: how they work. Preparing your response for you to approve is coming soon.")
 DISPUTE_TEXT = ("The buyer opens a dispute in PayPal, and you, the seller, respond to it. Vendor Guard will prepare that "
@@ -92,6 +94,7 @@ PERSONAL = re.compile(r"\S+@\S+|https?://\S+|www\.\S+|\+?[0-9][0-9 ().-]{6,}[0-9
                       r"|(?<![0-9A-Za-z])(?=[0-9A-Za-z]{0,16}[0-9])[0-9A-Za-z]{17}(?![0-9A-Za-z])", re.ASCII)  # ids
 US_PAGE = re.compile(re.escape(policy_pack.PAYPAL_PAGES) + r"[A-Za-z0-9._~/?#=&%+-]*", re.ASCII)  # fullmatch only
 TITLE_DROP = re.compile(r"[^\w .,'?!&-]")  # no [ ] ( ) : / so a title can't turn into a link
+DATA_URL = re.compile(r"data:image/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)")
 
 
 class State(MessagesState, total=False):  # Studio's Chat tab needs a state that extends MessagesState
@@ -111,6 +114,23 @@ def _text(state) -> str | None:
     if isinstance(content, list) and any(not isinstance(b, str) and b.get("type") != "text" for b in content):
         return None
     return str(state["messages"][-1].text)
+
+
+def _screenshot(state) -> bytes | None:
+    """The newest message's screenshot: its one non-text part, an image_url holding a PNG or JPEG as a base64 data: URL.
+    None for anything else. The type is read from the bytes, never from the URL."""
+    content = state["messages"][-1].content
+    parts = [b for b in content if not isinstance(b, str) and b.get("type") != "text"] if isinstance(content, list) else []
+    if len(parts) != 1 or parts[0].get("type") != "image_url":
+        return None
+    url = parts[0].get("image_url")
+    if not (m := DATA_URL.fullmatch(str(url.get("url") if isinstance(url, dict) else url))):
+        return None
+    try:
+        image = base64.b64decode(m[1], validate=True)
+    except binascii.Error:
+        return None
+    return image if llm.image_type(image) else None
 
 
 def _looks_like_chat(text: str) -> bool:
@@ -148,7 +168,8 @@ def _query(text: str) -> str:
 
 def search(question: str) -> list[tuple[str, str]]:
     """Up to 3 (title, url) PayPal US pages, or [] on any failure: fail closed, no retry."""
-    if not TAVILY_KEY:
+    if not TAVILY_KEY:  # warned here, not at import: main imports chat (through demo) even with the demo off
+        log.warning("TAVILY_API_KEY is not set: no search, PayPal's help link only")
         return []
     try:
         r = httpx.post(TAVILY_URL, timeout=httpx.Timeout(5.0, connect=3.0),
@@ -167,6 +188,8 @@ def search(question: str) -> list[tuple[str, str]]:
 
 @owns("intent", "entries")
 def classify(state):
+    if _text(state).strip().casefold() == "notes":  # a fixed word, as check: no LLM call, other() lists the notes
+        return {"intent": "other", "entries": []}
     user = f"<question>\n{sanitize(_text(state))}\n</question>"  # sanitize drops < and >: the tag can't be closed early
     try:
         choice = llm.ask(Choice, CLASSIFY_PROMPT, user, attempts=1)  # at most one Groq request per message
@@ -183,11 +206,23 @@ def start_check(state):
     return _say((PASTED if pasted else "") + ASK_PRICE + (PASTE_AGAIN if pasted else ""), awaiting="price", price=None)
 
 
+def runs_scam_check(state, text: str | None, image: bytes | None = None) -> bool:
+    """True when check() runs scam_check on this message: the chat as text, a screenshot, or both. A route that exposes
+    the chat counts it as a check (and a screenshot) and takes main.SCAM_LIMIT for it, as /scam-check does (503 when
+    busy). Studio has no limit, as with scam_check today."""
+    if text is None or text.strip().casefold() == "cancel" or state.get("awaiting") != "chat" or not state.get("price"):
+        return False
+    clean = sanitize(text)
+    # as ScamCheckIn and the /scam-check route
+    return (bool(clean) or image is not None) and len(text) <= MAX_CHARS and len(clean) <= MAX_CHARS
+
+
 @owns("messages", "awaiting", "price")
 def check(state):
-    """No LLM. When the API exposes the chat, its route must take main.SCAM_LIMIT for a message that reaches here
-    with awaiting="chat", as /scam-check does (503 when busy). Studio has no limit, as with scam_check today."""
-    text = _text(state)
+    """No LLM here. scam_check runs exactly when runs_scam_check says so, with the screenshot if there is one."""
+    text, image = _text(state), _screenshot(state)
+    if image is not None:
+        text = str(state["messages"][-1].text)  # the text sent with the screenshot, often none
     if text is not None and text.strip().casefold() == "cancel":
         return _say(CANCELLED, awaiting=None, price=None)
     if text is None:
@@ -199,14 +234,15 @@ def check(state):
     if state.get("awaiting") != "chat" or not state.get("price"):
         # the START router reads the raw input, where a crafted "awaiting" passes; the nodes see it filtered out
         return _say(ASK_PRICE, awaiting="price", price=None)
-    clean = sanitize(text)
-    if not clean or len(text) > MAX_CHARS or len(clean) > MAX_CHARS:  # as ScamCheckIn and the /scam-check route
+    if not runs_scam_check(state, text, image):
         return _say(BAD_CHAT)
     try:
         price = state["price"]
         # an empty context: a graph invoked inside a node inherits the caller's checkpointer and stream, which would
         # store scam_check's state (the chat, the buyer's quotes) in this thread and stream it to Studio
-        out = contextvars.Context().run(scam_check.run, text, price["amount"], price["currency"])
+        out = contextvars.Context().run(scam_check.run, text, price["amount"], price["currency"], image)
+    except scam_check.Unreadable as e:  # no verdict and no case: the seller sends it again
+        return _say(f"{str(e).capitalize()}. Type cancel to stop.")
     except Exception as e:
         log.warning("check failed: %s", type(e).__name__)
         return _say(CHECK_FAILED, awaiting=None, price=None)
@@ -235,8 +271,9 @@ def dispute(state):
 def other(state):
     if state.get("intent") == "not_paypal":
         return _say(NOT_PAYPAL)
-    titles = "; ".join(e["title"] for e in VERIFIED.values())
-    return _say(f"{INTRO}\n\nNotes I have: {titles}.\n\n{policy_pack.POLICY_PACK['vg_how_to_check']['text']}")
+    if _text(state).strip().casefold() == "notes":
+        return _say("Notes I have: " + "; ".join(e["title"] for e in VERIFIED.values()) + ".")
+    return _say(f"{INTRO}\n\n{policy_pack.POLICY_PACK['vg_how_to_check']['text']}")
 
 
 def _build(checkpointer=None):

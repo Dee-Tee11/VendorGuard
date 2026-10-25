@@ -1,26 +1,39 @@
 """The live demo: a tester makes a sale, pays it in PayPal's sandbox checkout with a shared buyer account, then checks
-the buyer's chat and watches every node and PayPal call (the streamed check is main.demo_check).
+the buyer's chat and watches every node and PayPal call (the streamed check is main.demo_check). The seller can also
+ask the chat graph (main.demo_chat), one conversation per session.
 
 On only with DEMO_MODE=true, and only against PayPal's sandbox (main.lifespan refuses to start otherwise). Creating and
 capturing orders are the app's only PayPal writes. They play the buyer's purchase and stay out of the graphs.
 The session is anonymous: the page keeps its id in sessionStorage, and everything goes when it ends.
 """
+import base64
 import os
+import re
 import secrets
+import threading
 import uuid
 from decimal import Decimal
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse
+from langchain_core.messages import RemoveMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from pydantic import BaseModel, Field
 
-from app import db, paypal, ratelimit, scam_check
+from app import chat, db, llm, paypal, ratelimit, scam_check
 
 ENABLED = os.getenv("DEMO_MODE", "").strip().lower() == "true"
 REQUIRED_ENV = ("DEMO_BUYER_EMAIL", "DEMO_BUYER_PASSWORD")
 CURRENCY = "USD"  # a US sandbox business account, as in the README's Seller Protection notes
 PAGE = Path(__file__).parent / "static" / "demo.html"
+# the chat graph with one thread per demo session (thread_id = session id), forgotten when the session ends.
+# ponytail: in memory, so a restart or Render's sleep forgets every conversation; PostgresSaver with dispute_defense
+chat_graph = chat._build(InMemorySaver())
+CASE_LINE = re.compile(r"^Case ([0-9a-f]{32})$", re.M)  # the last line chat.check writes after a check
+_busy: set[str] = set()  # sessions inside turn()
+_busy_lock = threading.Lock()  # turn() runs in the threadpool
 
 
 def enabled():
@@ -33,6 +46,20 @@ def session(x_demo_session: str = Header("", max_length=64)) -> str:
     if not x_demo_session or not db.touch_demo_session(x_demo_session):
         raise HTTPException(401, "this demo session has ended, reload the page to start a new one")
     return x_demo_session
+
+
+def turn(x_demo_session: str = Header("", max_length=64)):
+    """session(), held until the request ends: a chat message and "End demo" run one at a time per session (409), so
+    neither changes the thread under the other. Taken before the session is checked, so one that just ended is a 401.
+    Use with scope="function": the session is given back before the answer leaves, ready for the next message."""
+    with _busy_lock:
+        if x_demo_session in _busy:
+            raise HTTPException(409, "your last message is still running, wait for its answer")
+        _busy.add(x_demo_session)
+    try:
+        yield session(x_demo_session)
+    finally:
+        _busy.discard(x_demo_session)
 
 
 router = APIRouter(dependencies=[Depends(enabled)])
@@ -51,7 +78,7 @@ def page():
 @router.post("/demo/api/session")
 def new_session(request: Request):
     ratelimit.hit(request, "session")
-    db.end_demo_sessions()  # ponytail: idle sessions are swept here and at boot; a cron job if traffic ever needs it
+    _forget(db.end_demo_sessions())  # ponytail: idle sessions are swept here and at boot; a cron job if traffic needs it
     session_id = secrets.token_urlsafe(24)
     db.new_demo_session(session_id)
     return {"session_id": session_id, "client_id": os.environ["PAYPAL_CLIENT_ID"], "currency": CURRENCY,
@@ -108,6 +135,47 @@ def state(session_id: str = Depends(session)):
 
 
 @router.post("/demo/api/end")
-def end(session_id: str = Depends(session)):
-    db.end_demo_sessions(session_id)
+def end(session_id: str = Depends(turn, scope="function")):
+    _forget(db.end_demo_sessions(session_id))
     return {"ended": True}
+
+
+def _forget(session_ids: list[str]) -> None:
+    """The chat thread holds what the seller typed, the buyer's chat too (RECHECK #19): it goes with the session."""
+    for session_id in session_ids:
+        chat_graph.checkpointer.delete_thread(session_id)
+
+
+def _thread(session_id: str) -> dict:
+    return {"configurable": {"thread_id": session_id}}
+
+
+def runs_check(session_id: str, message: str, image: bytes | None = None) -> bool:
+    """True when this message runs a scam check, decided as chat.check decides it."""
+    return chat.runs_scam_check(chat_graph.get_state(_thread(session_id)).values, message, image)
+
+
+def chat_turn(session_id: str, message: str, image: bytes | None = None) -> dict:
+    """One message through the chat graph: its reply, and how it was routed, for the live panel."""
+    nodes, state = {}, {}
+    content = message if image is None else [
+        {"type": "text", "text": message},
+        {"type": "image_url", "image_url": {"url": f"data:{llm.image_type(image)};base64,{base64.b64encode(image).decode()}"}},
+    ]
+    # the thread's messages start afresh each turn: no node reads past the newest, and InMemorySaver would store the
+    # whole history again in every checkpoint (a screenshot too: it stays only until the next turn or the session ends)
+    turn_input = {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), {"role": "user", "content": content}]}
+    for mode, chunk in chat_graph.stream(turn_input, _thread(session_id), stream_mode=["updates", "values"]):
+        if mode == "updates":
+            nodes.update(chunk)
+        else:
+            state = chunk  # the last one is this run's final state
+    reply = state["messages"][-1].content
+    route = next(node for node in nodes if node != "classify")
+    if route == "check" and (case := CASE_LINE.search(reply)):
+        # ponytail: the reply is the only place the chat's check gives its case id; parsed so ending the session
+        # deletes the case too. A graph change could put case_id in the chat state instead.
+        db.add_demo_case(session_id, case[1])
+    classified = nodes.get("classify") or {}
+    return {"reply": reply, "route": route, "intent": classified.get("intent"),
+            "notes": classified.get("entries", []), "awaiting": state.get("awaiting")}

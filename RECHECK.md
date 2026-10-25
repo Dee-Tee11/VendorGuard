@@ -64,6 +64,7 @@ Authentication and authorization are still being built, so some of these may no 
 - [ ] **19. The chat thread keeps the buyer's chat.** [app/chat.py](app/chat.py)
   Added 2026-10-22 with the `chat` graph, not from the review. In the Chat tab every message enters `messages` before any node runs, so the checkpointer stores the buyer's chat (in `langgraph dev`: `.langgraph_api/`). `/scam-check` never stores it. The chat's LLM never reads it again, but it is personal data at rest. `RemoveMessage` only clears the latest state, and deleting a thread in `langgraph dev` leaves the message blobs on disk.
   *Fix:* before the chat gets an API endpoint, take the buyer's chat in a field that is not a message, or run the check on a thread with no checkpointer.
+  *2026-10-25:* the chat now has a demo endpoint (`POST /demo/api/chat`). There the thread is in memory and deleted when the demo session ends or the service restarts, so nothing reaches disk. Still open for any endpoint outside the demo.
 
 - [ ] **20. Names can reach Tavily.** [app/chat.py](app/chat.py)
   Added 2026-10-22. The search query drops self-introductions ("I'm Amanda"), emails, links, phone numbers and IDs, but not other names ("my buyer John wants F&F"). Tavily's terms give it a perpetual licence over queries.
@@ -77,3 +78,18 @@ Authentication and authorization are still being built, so some of these may no 
 - [ ] **22. Vendor Guard's own notes cite the README.** [app/policy_pack.py:17](app/policy_pack.py#L17)
   Added 2026-10-24, from the E06 eval. The `vg_*` notes end with "Source: README.md#graph-1-scam_check", which a seller can't open. A PayPal link would be a false source: these notes describe Vendor Guard's rules, not PayPal's.
   *Fix:* with the frontend, a page for the policy pack, such as `GET /help`, built from the same entries with one anchor per note, and `source_url="/help#<key>"`. Update the `README.md#` check in `tests/test_chat.py`. Also move the "different transaction IDs" sentence out of `vg_why_wait`, so `pp_different_ids` answers it with PayPal's link.
+
+- [ ] **26. A screenshot sent with "can you verify this?" is dropped, and the seller has to send it again.** [app/chat.py](app/chat.py) (`start_check`)
+  Added 2026-10-25, from a live test on `/demo`. The seller attached `receipt-….png` with "Hi can you verify this ?" before saying `check`. `route_in` sent it to `start_check`, which works as designed: the image isn't read and the reply asks for the price, then says "paste the chat again". To the seller it looks as if Vendor Guard ignored the screenshot. The reply also talks about "the chat" and "a question" when they sent an image and a request.
+  *Fix, to decide:* keep the screenshot (or the pasted chat) until the price comes, then run the check on it without asking again. That stores the buyer's data one step longer (see #19). It also needs `runs_scam_check` and the demo's rate limit to count it at the price step. Or keep dropping it, but with a reply written for an image: "Got your screenshot. What price did you ask for? Then send it again."
+
+- [ ] **27. No dataset for multi-turn chats and screenshots.** [tests/chat_dataset.jsonl](tests/chat_dataset.jsonl)
+  Added 2026-10-25, after #26. The 39 cases are all one text message each, so they test `classify`, not how the chat behaves over several turns or with images. #26 was found by hand.
+  *To do:* about 30–40 multi-turn cases, scored on the reply and the state (`awaiting`, `price`, whether `scam_check` ran and with what):
+  - a screenshot with or without text, at each step (before `check`, at the price, at the chat);
+  - "check" written in other ways ("can you verify this?", "é seguro enviar?", "is this payment real?");
+  - a price and the chat in one message;
+  - cancelling, or asking a question, halfway through;
+  - an image that isn't PNG or JPEG, and two images;
+  - EN and PT.
+  Draw the screenshots with Pillow, as `tests/test_eval_screenshot.py` does, or use the demo's "Download receipt". Run it like the E06 eval, and fix #26 against it.

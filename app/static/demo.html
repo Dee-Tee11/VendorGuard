@@ -117,6 +117,17 @@
   .log pre { margin: 6px 0 0; padding: 10px; background: var(--paper); border-radius: 4px; font: 12.5px/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; }
   .empty { color: var(--muted); font-size: 15px; padding: 14px 0; }
 
+  /* the chat */
+  .talk { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 8px; max-height: 460px; overflow-y: auto; }
+  .talk:empty { display: none; }
+  .talk li { max-width: 88%; padding: 9px 13px; border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; }
+  .talk li.me { align-self: flex-end; background: #e4e9f6; }
+  .talk li.vg { align-self: flex-start; background: var(--paper); border: 1px solid var(--rule); }
+  .talk a { color: var(--pen); }
+  .ask { display: flex; gap: 10px; align-items: flex-end; }
+  .ask textarea { min-height: 46px; height: 46px; flex: 1; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+
   .ended { max-width: 640px; margin: 15vh auto; padding: 0 24px; }
   .ended h1 { font-size: 32px; margin: 0 0 8px; }
 </style>
@@ -171,6 +182,21 @@
           <p class="note" id="check-note" role="status"></p>
         </form>
         <div class="result" id="result" aria-live="polite"></div>
+      </section>
+
+      <section class="step" aria-labelledby="s4">
+        <h2 id="s4">Ask Vendor Guard</h2>
+        <p>Questions about selling with PayPal, answered from notes checked against PayPal's own pages. You can also type check to verify a payment here, step by step.</p>
+        <div class="chips" id="asks"></div>
+        <ol class="talk" id="talk" aria-live="polite"></ol>
+        <form class="ask" id="ask">
+          <label class="sr-only" for="message">Your message</label>
+          <textarea id="message" maxlength="8000" placeholder="Ask a question, or type check"></textarea>
+          <label class="btn quiet" for="ask-shot" title="Attach the buyer's chat as a screenshot, when Vendor Guard asks for it">Screenshot</label>
+          <input class="sr-only" id="ask-shot" type="file" accept="image/png,image/jpeg">
+          <button class="btn" id="send" type="submit">Send</button>
+        </form>
+        <p class="note" id="ask-note" role="status"></p>
       </section>
     </div>
 
@@ -239,6 +265,7 @@ async function problem(r) {
 }
 
 async function api(path, body) {
+  if (!session) throw new Error("The demo is still starting, try again in a moment.");
   const r = await fetch(path, {
     method: body === undefined ? "GET" : "POST",
     headers: {"X-Demo-Session": session.session_id, "Content-Type": "application/json"},
@@ -350,12 +377,35 @@ async function refresh() {
   try { state = await (await api("/demo/api/state")).json(); } catch { return; }
   $("sales").replaceChildren(...state.sales.map((s) => el("li", {},
     el("span", {}, s.item), el("span", {}, `${s.amount} USD`),
-    s.capture_id ? el("span", {}, "Transaction ", el("code", {}, s.capture_id), ` ${s.capture_status}`) : el("span", {}, "not paid yet"))));
+    s.capture_id ? el("span", {}, "Transaction ", el("code", {}, s.capture_id), ` ${s.capture_status} `,
+      el("button", {class: "btn quiet", type: "button", onclick: () => receipt(s)}, "Download receipt"))
+      : el("span", {}, "not paid yet"))));
   for (const e of state.events) {
     if (seenEvents.has(e.id)) continue;
     seenEvents.add(e.id);
     log("Webhook", "webhook", `${e.event_type}, signature verified by PayPal. ${e.summary || ""}`, e);
   }
+}
+
+// a PNG of a real sandbox capture, to test screenshots in step 3. Labelled as the demo's: no PayPal branding
+function receipt(s) {
+  const lines = [
+    ["Vendor Guard sandbox demo: payment receipt", "bold 26px sans-serif"],
+    ["Sandbox test payment, no real money", "16px sans-serif"],
+    ["", ""],
+    [`Item: ${s.item}`, "20px sans-serif"],
+    [`Amount: ${s.amount} USD`, "bold 22px sans-serif"],
+    [`Transaction ID: ${s.capture_id}`, "20px monospace"],
+    [`Status: ${s.capture_status}`, "20px sans-serif"],
+    [`Downloaded: ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC`, "16px sans-serif"],
+  ];
+  const c = el("canvas", {width: 640, height: 60 + 40 * lines.length});
+  const g = c.getContext("2d");
+  g.fillStyle = "#fff";
+  g.fillRect(0, 0, c.width, c.height);
+  g.fillStyle = "#111";
+  lines.forEach(([text, font], i) => { g.font = font || "16px sans-serif"; g.fillText(text, 30, 50 + 40 * i); });
+  el("a", {href: c.toDataURL("image/png"), download: `receipt-${s.capture_id}.png`}).click();
 }
 
 // ---- step 3: scenarios ----
@@ -500,6 +550,50 @@ async function check(event) {
   }
 }
 
+// ---- the chat ----
+const ASKS = ["What does WAIT mean?", "Is Friends and Family safe for selling?", "I got a dispute, what now?", "check"];
+const PAYPAL_LINK = /(https:\/\/www\.paypal\.com\/[^\s)]*[^\s.,)])/;  // the chat shows PayPal links only
+
+function bubble(cls, text) {
+  const parts = text.split(PAYPAL_LINK).map((part, i) =>
+    i % 2 ? el("a", {href: part, target: "_blank", rel: "noopener"}, part) : part);
+  $("talk").append(el("li", {class: cls}, parts));
+  $("talk").scrollTop = $("talk").scrollHeight;
+}
+
+const ROUTES = {question: "answered a question", start_check: "started a check", check: "took a step of the check",
+                dispute: "explained disputes", other: "introduced itself"};
+
+let sending = false;  // one message at a time, as the server asks (409)
+async function send(message) {
+  const file = $("ask-shot").files[0];
+  if (sending || (!message.trim() && !file)) return;
+  if (file && file.size > 3_000_000) return note("ask-note", "The screenshot must be under 3 MB.", true);
+  sending = true;
+  note("ask-note", "");
+  bubble("me", file ? `📎 ${file.name}${message ? `\n${message}` : ""}` : message);
+  $("message").value = "";
+  $("ask-shot").value = "";
+  $("send").disabled = true;
+  try {
+    const body = {message};
+    if (file) body.image = await readImage(file);
+    const r = await (await api("/demo/api/chat", body)).json();
+    bubble("vg", r.reply);
+    const how = r.intent ? `The model picked “${r.intent}”${r.notes.length ? ` and the notes ${r.notes.join(", ")}` : ""}; the reply is written by code.` : "No model call: the code routed it.";
+    const ran = r.route === "check" && !r.awaiting && /^Case /m.test(r.reply) ? " It ran scam_check: use step 3 to watch a check's PayPal calls." : "";
+    const what = r.intent === "not_paypal" ? "said it works with PayPal only" : ROUTES[r.route] || r.route;
+    log("Chat", "llm", `${what}. ${how}${ran}`, r);
+  } catch (e) {
+    if (e instanceof Ended) return;
+    note("ask-note", e.message, true);
+    if (!$("message").value) $("message").value = message;  // a busy or refused message can be sent again
+  } finally {
+    sending = false;
+    if ($("send")) $("send").disabled = false;
+  }
+}
+
 // ---- start ----
 async function start() {
   rail();
@@ -524,9 +618,18 @@ document.querySelectorAll("[data-copy]").forEach((b) => b.addEventListener("clic
   try { await navigator.clipboard.writeText($(b.dataset.copy).textContent); b.textContent = "Copied"; setTimeout(() => { b.textContent = "Copy"; }, 1500); } catch {}
 }));
 $("check").addEventListener("submit", check);
+$("ask").addEventListener("submit", (e) => { e.preventDefault(); send($("message").value); });
+$("ask-shot").addEventListener("change", () => {
+  const file = $("ask-shot").files[0];
+  note("ask-note", file ? `Attached ${file.name}. Press Send.` : "");
+});
+$("message").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send($("message").value); }
+});
+$("asks").replaceChildren(...ASKS.map((q) => el("button", {class: "chip", type: "button", onclick: () => send(q)}, q)));
 $("end").addEventListener("click", async () => {
   if (!confirm("End the demo and delete your sales and checks from Vendor Guard?")) return;
-  try { await api("/demo/api/end", {}); } catch (e) { if (e instanceof Ended) return; }
+  try { await api("/demo/api/end", {}); } catch (e) { if (!(e instanceof Ended)) alert(e.message); return; }
   store(null);
   showEnded("Demo ended", "Your sales and checks were deleted from Vendor Guard.");
 });

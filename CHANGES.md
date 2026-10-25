@@ -1,5 +1,34 @@
 # Changes
 
+## 2026-10-25: chat on the demo, and the first real payment
+
+**Chat API** (`POST /demo/api/chat`, the "Ask Vendor Guard" panel on `/demo`)
+- The `chat` graph is reachable over HTTP for the first time. Each demo session has its own thread in an `InMemorySaver`, deleted when the session ends or is swept, so the buyer's chat a seller pastes never reaches disk (RECHECK #19, for the demo only).
+- The answer gives the reply and how the message was routed (`route`, `intent`, `notes`), and the live panel shows that.
+- When the next message is the buyer's chat, which runs `scam_check`, it counts as a check against the per-IP limit and takes a slot (503 when busy), as `chat.check`'s docstring asks.
+- Its case is tied to the session, so ending the session deletes it. The case id is read from the reply's last line ("Case …", written by `chat.check`), because the chat state doesn't hold it.
+- No graph changed. A chat check runs `scam_check` in an empty context (C06), so its PayPal calls aren't in the live panel; step 3 shows them.
+- `db.end_demo_sessions()` now returns the ids it deleted. The real-SQL test caught a bug there that the fakes missed: `fetchall()` called on the connection instead of the cursor.
+- After a code review of the above:
+  - **One message at a time per session** (`demo.turn`): a second chat message, or "End demo", while a message is still running is a 409. Before, two overlapping turns could fork the thread: a question sent during a check ran as the buyer's chat (a second check, past the global cap), a turn could return the other's reply and miss its case id, and ending the session mid-check recreated the deleted thread and left its case and claimed payment with no session. The page also sends one message at a time.
+  - Whether a message runs a check is decided by `chat.runs_scam_check`, which `chat.check` uses too, so the route can't disagree with the node. A blank message during the check flow no longer counts as a check.
+  - Each turn clears the thread's old messages (`RemoveMessage(REMOVE_ALL_MESSAGES)` in the input; no node reads past the newest). `InMemorySaver` stores the messages again in every checkpoint, so a long session grew quadratically; now it grows linearly. The reply is read from the run's own stream, not from a second `get_state`.
+  - The slot logic of `/scam-check` and the chat is one helper (`main._slot`).
+  - `chat` warns about a missing `TAVILY_API_KEY` when it would search, not at import, since `main` imports it even with the demo off.
+  - Page: a refused message goes back in the box, Enter while composing with an IME doesn't send, nothing is sent before the session exists, and "End demo" says why it failed instead of claiming it deleted everything.
+- **Screenshots in the chat.** At the chat step, `chat.check` takes a screenshot (one `image_url` part, a PNG or JPEG `data:` URL, typed by its bytes) with or without text, and passes it to `scam_check.run()`. An unreadable one is asked for again. Before and after that step nothing changes: an image starts the check without being read. `POST /demo/api/chat` takes an optional `image` (the same type as `/scam-check`'s), and such a message counts as a check and a screenshot. The Ask panel has a Screenshot button, and `vg_how_to_check` no longer says screenshots aren't supported. No graph's nodes or edges changed. Tests: C17, D17, and three more C16 cases.
+- Each paid sale on `/demo` has a "Download receipt" button: a PNG of the real sandbox capture, drawn in the browser and labelled as the demo's, to test screenshots with.
+- The intro no longer lists every note title, which made a greeting a wall of text. It says "Say notes", and the word `notes`, matched exactly like `check`, gets the list from `other` with no `classify` call. No graph changed.
+- Tests: D12–D16 (248 offline in total), and the real-SQL tests check the returned ids. D15 now covers the idle sweep too, and a real-SQL assertion that could never fail now checks the sweep's own result.
+
+**Run for real**
+- A payment through the PayPal button worked end to end, with the shared buyer `sb-kfrny…@personal.example.com`:
+  - the order was created and captured, COMPLETED, 45.00 USD;
+  - `CHECKOUT.ORDER.APPROVED` and `PAYMENT.CAPTURE.COMPLETED` arrived, both with the signature verified by PayPal. This confirms P02: webhooks from real sandbox payments pass verification.
+- In the checkout, PayPal offered "Pay over time" (a Synchrony credit line) after login, despite `disable-funding=credit,paylater` on the button. Closing it and paying with the PayPal balance works.
+- Through the chat, with real Groq: a greeting got the intro, "What does WAIT mean?" got `vg_why_wait`, and the Friends and Family question got the two PayPal notes. "The buyer paid me by Zelle" got `not_paypal`. "check" → price → chat ran a check.
+- An unknown ID now gives `NOT_FOUND` instead of `UNAVAILABLE`: Transaction Search answers, so the permission is active on the sandbox app.
+
 ## 2026-10-24: live sandbox demo (`/demo`)
 
 **What it is** ([app/demo.py](app/demo.py), [app/static/demo.html](app/static/demo.html), README "Live sandbox demo")
