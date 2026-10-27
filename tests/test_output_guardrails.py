@@ -4,7 +4,8 @@ from app import output_guardrails, scam_check
 from app.output_guardrails import Sentence
 
 EVIDENCE = {
-    "E1": {"status": "FOUND", "paypal_status": "COMPLETED", "amount": "25.00", "currency": "EUR"},
+    "E1": {"status": "FOUND", "paypal_status": "COMPLETED", "amount": "25.00", "currency": "EUR",
+           "amount_check": "differs"},
     "E2": {"type": "URGENCY_PRESSURE", "label": "rushes or threatens you", "confirmed": "yes", "quote": "ship today"},
 }
 
@@ -29,6 +30,7 @@ def test_grounded_sentences_pass(sentence):
     pytest.param(s("The chat shows {{E2.label}}."), "placeholder", id="U18 placeholder of an uncited source"),
     pytest.param(s("PayPal shows {{E1.payer}}."), "placeholder", id="U18 unknown field"),
     pytest.param(s("The buyer wrote {{E2.quote}}.", ["E2"]), "placeholder", id="U18 quote is never fillable"),
+    pytest.param(s("The amount {{E1.amount_check}} the price."), "placeholder", id="U18 amount_check is never fillable"),
     pytest.param(s("PayPal shows {E1.status}."), "brace", id="U18 stray brace"),
     pytest.param(s("The buyer paid 25 already."), "digit", id="U19 digit"),
     pytest.param(s("The buyer paid E500 extra."), "digit", id="U19 number shaped like an evidence id"),

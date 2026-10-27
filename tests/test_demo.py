@@ -245,7 +245,8 @@ def test_d16_a_session_takes_one_message_at_a_time(demo_db, choice):
 def test_d17_a_screenshot_in_the_chat_runs_the_check_and_counts_as_one(demo_db, choice, monkeypatch):
     ran = []
     monkeypatch.setattr(scam_check, "run", lambda *args: ran.append(args) or {
-        "case_id": "c1", "verdict": "WAIT", "message": "m", "sentences": [], "persisted": True})
+        "case_id": "c1", "verdict": "WAIT", "message": "m", "sentences": [], "steps": ["s"], "support": "help",
+        "persisted": True})
     h, png = start(), "iVBORw0KGgoAAAAAAAAAAA=="
     early = client.post("/demo/api/chat", json={"message": "", "image": png}, headers=h).json()
     assert early["route"] == "start_check" and not ran  # before the price: not read, not a check

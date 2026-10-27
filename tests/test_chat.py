@@ -3,6 +3,7 @@ import base64
 import importlib
 import json
 from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -17,6 +18,7 @@ from tests.test_scam_check import (  # noqa: F401  (claimed is an autouse fixtur
 
 FAKE_RESULT = {"case_id": "c1", "verdict": "WAIT", "message": scam_check.POLICY["P.WAIT_NOT_CONFIRMED"],
                "sentences": [{"text": "PayPal has no record of the transaction IDs in this chat.", "sources": ["E1"]}],
+               "steps": scam_check.steps("P.WAIT_NOT_CONFIRMED", None), "support": scam_check.SUPPORT,
                "evidence": {"E2": {"quote": "QUOTE-CANARY"}}, "template": True, "signals_checked": True, "persisted": True}
 
 
@@ -354,6 +356,16 @@ def test_u16_every_entry_is_sourced_and_vendor_guard_ones_are_verified():
             assert entry["source_url"].startswith("README.md#") and entry["verified"], key
         else:
             assert chat.US_PAGE.fullmatch(entry["source_url"]), key
+
+
+def test_u16_every_outcome_has_a_what_to_do_note():
+    assert set(scam_check.STEPS) == set(scam_check.POLICY)  # a new outcome needs its next steps
+    assert set(scam_check.SIGNAL_STEPS) == set(scam_check.SIGNALS)
+    for pid in scam_check.POLICY:
+        text = chat.VERIFIED[f"vg_{pid[2:].lower()}"]["text"]
+        assert scam_check.POLICY[pid] in text and text.endswith(scam_check.SUPPORT)
+    assert scam_check.CONTACT_PAYPAL.startswith(policy_pack.PAYPAL_PAGES)
+    assert f'"{scam_check.CONTACT_PAYPAL}"' in (Path(chat.__file__).parent / "static/demo.html").read_text()
 
 
 @pytest.fixture

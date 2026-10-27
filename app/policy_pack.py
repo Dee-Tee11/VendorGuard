@@ -3,7 +3,7 @@
 An entry is shown, or offered to the LLM, only when verified is True: a person has read its source page (test U16).
 PayPal texts repeat their page; the only edit is "we/our" -> "PayPal", so they don't read as Vendor Guard speaking.
 """
-from app.scam_check import MONEY_OUT_WARNING, POLICY
+from app.scam_check import MONEY_OUT_WARNING, POLICY, STEPS, SUPPORT
 
 REGION = "us"  # the sandbox's region: Seller Protection, deadlines and help pages depend on it
 PAYPAL_PAGES = f"https://www.paypal.com/{REGION}/"
@@ -27,6 +27,14 @@ def _partial(url: str) -> str:
     return f" This is not PayPal's full list: check every requirement on PayPal's page: {url}"
 
 
+def _what_to_do(pid: str) -> dict:
+    """One note per outcome, so the chat can answer "what do I do now?" with only the seller's own outcome."""
+    label, shown, todo = STEPS[pid]
+    title = f"WAIT, {label.lower()}: what to do" if pid.startswith("P.WAIT") else f"{label}: what to do"
+    return _vg(title, f"You saw: {POLICY[pid]}\n{shown}\nWhat to do:\n"
+               + "\n".join(f"{n}. {s}" for n, s in enumerate(todo, 1)) + f"\n{SUPPORT}", "graph-1-scam_check")
+
+
 POLICY_PACK = {
     "vg_verdicts": _vg(
         "Vendor Guard's verdicts",
@@ -38,12 +46,13 @@ POLICY_PACK = {
     ),
     "vg_why_wait": _vg(
         "Why Vendor Guard says WAIT",
-        "WAIT means Vendor Guard could not confirm a completed payment of your price. It comes with one of these: "
-        + " ".join(text for key, text in POLICY.items() if key.startswith("P.WAIT"))
-        + " A transaction ID that PayPal can't find is not proof of a scam: PayPal gives the buyer and the seller "
-        "different transaction IDs for the same payment.",
+        "WAIT means Vendor Guard could not confirm a completed payment of your price, so don't ship yet. "
+        "The sentence under WAIT says which of these happened:\n"
+        + "\n".join(f"{label}: {shown}" for pid, (label, shown, _) in STEPS.items() if pid.startswith("P.WAIT"))
+        + "\nAsk me what to do about yours, for example: the amount paid is not my price, what do I do?",
         "graph-1-scam_check",
     ),
+    **{f"vg_{pid[2:].lower()}": _what_to_do(pid) for pid in STEPS},
     "vg_how_to_check": _vg(
         "How to check a payment",
         "Say check. I'll ask for your price, for example 25.00 USD, and then for the buyer's chat: paste it exactly "

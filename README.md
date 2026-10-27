@@ -189,7 +189,7 @@ The LLM chooses the words and the code supplies the facts.
 1. **Closed context.** Each call sees only this case's evidence and the one `policy_pack` entry chosen by `load_policy`. No web text reaches the LLM, and no other cases.
 2. **Sentences with sources.** Output is a list of `Sentence` (closed `intent`, at least one source: `E…` for evidence, `P.…` for policy).
 3. **Facts by placeholder.** The model writes `{{E2.delivered_at}}`, never a date. The code fills in the real value, and policy text is inserted verbatim by `policy_id`.
-4. **Deterministic validation.** Every source must exist, every placeholder must belong to a cited source, and no numbers, dates, emails, URLs or phone numbers may appear outside placeholders. Banned phrases ("guaranteed", "you will win", legal or tax advice, other platforms) are rejected.
+4. **Deterministic validation.** Every source must exist, every placeholder must belong to a cited source, and no numbers, dates, emails, URLs or phone numbers may appear outside placeholders. Banned phrases ("guaranteed", "you will win", legal or tax advice, other platforms) are rejected. The sentence about the payment always comes from code, a fixed template that shows the status and both amounts, because a grounded sentence could still contradict the verdict ("{{E1.amount}}, in line with {{E1.expected_amount}}"). The model sees only the warning signs and writes 1 to 3 sentences about them. With no warning signs, it isn't called.
 5. **Abstaining is valid.** Missing proof goes in `missing` with an `ADMIT_MISSING` sentence. Inventing it is a failure.
 6. **Safe fallback.** Two failures in a row fall back to a fixed template per verdict or reason, with no LLM, and the case is flagged for review.
 
@@ -379,7 +379,13 @@ The plan has 61 test cases in six layers, plus C01–C17 for the chat and D01–
   - U01–U05: the verdict table.
   - U09–U10: `@owns`.
   - U17–U20: the output guardrails (tests/test_output_guardrails.py).
-  - Evals (`pytest -m eval`): real Groq drafts for 10 verdict paths must pass the output guardrails, and 3 injection chats run through the whole graph must not put buyer text in the reply (tests/test_eval_output_guardrails.py).
+  - Evals (`pytest -m eval`): 3 injection chats run through the whole graph must not put buyer text in the reply (tests/test_eval_output_guardrails.py).
+  - E07 (tests/test_eval_seller.py, `pytest -m eval -s`): 35 made-up conversations of a seller with Vendor Guard, in tests/seller_dataset.jsonl, in English. Each one has 1 to 4 turns.
+    - The scenarios are questions about PayPal, suspicions described in words, a check run in the chat followed by questions about its result, and disputes, other payment services, small talk and injections.
+    - PayPal is mocked and Tavily is off. The chat graph runs with the real Groq model.
+    - Each turn is scored by rules: the node that answered, the notes it had to show, and the verdict.
+    - An LLM judge then scores each whole conversation against a reference written from `policy_pack`'s notes: correct, next steps, safe, covers the reference, and 1–5. The judge is the app's own model, so read the conversations too.
+    - Each run saves every conversation to tests/eval_results/, with the KPIs per rule, per criterion and per scenario. The first run (15/35 passing, judge mean 3.89) is kept in tests/eval_baselines/ to compare later runs against.
   - Screenshot evals (tests/test_eval_screenshot.py): drawn PT and EN chats, one with an injection, must be copied word for word with the ID and the right `Buyer:`/`Seller:` labels. A blurred chat must not be guessed, and a screenshot alone run through the whole graph must give `SCAM_LIKELY`.
   - Screenshots, offline: a screenshot alone, a screenshot plus text, bad uploads, a failed copy (no verdict, no case, PayPal not called), and no tools or secrets in the vision call (S03).
   - N01–N04: PayPal 404, 403, 429, 503, timeouts, token failure, Transaction Search rows, LLM and database failures.

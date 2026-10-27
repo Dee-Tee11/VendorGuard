@@ -22,6 +22,43 @@
 - The intro no longer lists every note title, which made a greeting a wall of text. It says "Say notes", and the word `notes`, matched exactly like `check`, gets the list from `other` with no `classify` call. No graph changed.
 - Tests: D12–D16 (248 offline in total), and the real-SQL tests check the returned ids. D15 now covers the idle sweep too, and a real-SQL assertion that could never fail now checks the sweep's own result.
 
+**Wrong-amount explanations show both amounts**
+- Found on `/demo`: a COMPLETED payment for the wrong amount got the WAIT card with "the amount differs the expected amount" and no numbers. The model had used `{{E1.amount_check}}`, which fills in the bare word `differs`, and the guardrails only checked that placeholders were allowed, not that the needed ones were there.
+- `amount_check` is now in `output_guardrails.NOT_FILLABLE`: the model still sees it, but can't put it in a sentence.
+- When `amount_check` is `differs` (any verdict, not only `P.WAIT_WRONG_AMOUNT`), `validate_output` drops the model's sentences that cite E1 and puts the template's E1 sentence first, which shows both amounts. Only checking that the amount placeholders were present was not enough: "{{E1.amount}}, in line with {{E1.expected_amount}}" passed next to a "Don't ship". The model's sentences about warning signs are kept. If nothing of the model's is left, `template` is true. No graph change, and the prompt is unchanged: telling the model which placeholders to use, in the shared prompt, made it write `{{E1.amount}}` for payments that have none.
+- Tests: two N04 cases and one U18 case. The "too old" eval fails before and after this change: the model writes "14 days" and `{{Ek.label}}`.
+
+**Every outcome says what to do, and how to reach PayPal** (RECHECK #28, step 1)
+- Found on `/demo`: a seller got WAIT for a wrong amount, pasted the card's sentence into the chat and asked what to do. The reply was `vg_why_wait`, every `P.WAIT_*` instruction in one paragraph, with no next step.
+- `scam_check.STEPS` gives each of the 9 policy ids a label, what PayPal showed and numbered next steps. `SIGNAL_STEPS` adds one step for each warning sign found, whether its quote was confirmed or not. Facts about PayPal in the steps come from the verified notes in `policy_pack`.
+- `SUPPORT` ends every outcome: "Still unsure? … Contact PayPal". It links to PayPal's US Contact Us page (`CONTACT_PAYPAL`, live chat with a person), checked on 2026-10-25.
+- `scam_check`'s result has two new fields, `steps` and `support`. They are fixed text, outside the model and the guardrails. The verdict card shows them as "What to do" and a Contact PayPal link, and `chat.check` writes them before the "Case …" line. The stored case keeps them too. No nodes or edges changed.
+- In the chat, `vg_why_wait` is now one line per WAIT reason. Each outcome has its own note (`vg_verified`, `vg_verified_warn`, `vg_scam_likely`, `vg_wait_wrong_amount`, …). The note quotes the instruction the seller saw and ends with `SUPPORT`, so `classify` can pick just that one. The notes leave out the steps for each warning sign: the chat doesn't know the seller's case (RECHECK #28, step 2).
+- Tests: U16 checks that every policy id and signal has its steps and that each note ends with `SUPPORT`. It also checks that the page's link matches `CONTACT_PAYPAL`. S02 checks the steps for each warning sign. A new eval row holds the seller's message from `/demo`.
+
+**Code writes the payment sentence, the model only the warning signs** (from `/code-review`)
+- The wrong-amount fix above was one special case in `validate_output`. It could drop the warning-signs sentence, mark a passing draft as `template`, and give 5 sentences. A grounded model sentence could still contradict a "Don't ship" for the other reasons too ("PayPal shows {{E1.paypal_status}}, so it is complete").
+- Now the first sentence is always `PAYMENT_TEMPLATE`'s, written by code. `_explain_input` no longer shows the model E1, and `validate_output` checks its sentences against the signal evidence only, so a sentence that cites E1 fails. The model writes 1 to 3 sentences, so the reply has at most 4 (`output_guardrails.validate` takes `most`). With no warning signs, or signals unknown, the model isn't called. That fixes RECHECK #15: the model can no longer invent an E2.
+- `template` is true only when the model's sentences failed the checks. The special case is gone.
+- Same nodes and edges. What changed is what `explain_and_reply` writes, and `EXPLAIN_PROMPT` now asks only about the warning signs.
+- Tests: N04 now covers an LLM error, an ungrounded draft, a draft about the payment, four sentences, and no LLM call without warning signs. S03 and S04 now use drafts about the signals. A bad-screenshot case that repeated the data-URL test is folded into it (262 offline in total).
+
+**E07: made-up conversations of a seller with Vendor Guard** (`tests/seller_dataset.jsonl`, `tests/test_eval_seller.py`)
+- The question is whether Vendor Guard guides a seller well: right answers, clear next steps, safe advice.
+- 35 conversations in English, 1 to 4 turns each, in four scenarios:
+  - questions about PayPal (9);
+  - suspicions the seller describes in words (9);
+  - a check run in the chat (check → price → the buyer's chat, PayPal mocked), then a question about the result (11);
+  - disputes, other payment services, small talk and injections (6).
+- Each turn has the expected node, the notes it must show and, for a check, the verdict. Each conversation has a reference: what good advice covers, written from `policy_pack`'s verified notes.
+- The chat graph runs with the real Groq model, and Tavily is off. Each turn is scored by those rules. Then an LLM judge (the app's own model, `llm.MODEL`) scores the whole conversation against the reference: correct, next steps, safe, covers the reference, and 1–5 with a reason.
+- Each run saves every conversation to `tests/eval_results/seller-*.jsonl`. The `.txt` holds the KPIs (per rule, per criterion, per scenario) and every conversation as the seller saw it, with the rules it broke and the judge's answer.
+- It replaces the 10-case explanation eval in `tests/test_eval_output_guardrails.py`, whose `calls` fixture and result writer the E06 chat eval now shares.
+- First run on 2026-10-25 (10 minutes, about 111,000 tokens, 9 rate limits waited out): 15/35 conversations passed everything. It is kept as the baseline in `tests/eval_baselines/seller-20261025T193317Z.txt` and `.jsonl`, since `tests/eval_results/` is ignored by git.
+  - Rules: 85/89 turns routed right, 26/28 required notes shown, 11/11 verdicts.
+  - Judge: correct 31/35, next steps 20/35, safe 32/35, covers the reference 23/35, mean 3.89.
+  - The main failure: a follow-up after a check doesn't know the result (RECHECK #28). "What do I do now?" got the intro, "I don't have that information", or a new check.
+
 **Run for real**
 - A payment through the PayPal button worked end to end, with the shared buyer `sb-kfrny…@personal.example.com`:
   - the order was created and captured, COMPLETED, 45.00 USD;

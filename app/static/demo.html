@@ -227,6 +227,7 @@ const NODES = [
   ["safe_template", "Falls back to fixed sentences"],
   ["persist_case", "Saves the case"],
 ];
+const CONTACT_PAYPAL = "https://www.paypal.com/us/cshelp/contact-us";  // as scam_check.CONTACT_PAYPAL (test U16)
 const VERDICT = {VERIFIED: "Verified", VERIFIED_WITH_WARNINGS: "Verified, with warnings", WAIT: "Wait", SCAM_LIKELY: "Likely scam"};
 const $ = (id) => document.getElementById(id);
 let session = null;
@@ -509,6 +510,9 @@ function showResult(r) {
     el("p", {class: "message"}, r.message),
     el("ul", {class: "sentences"}, r.sentences.map((s) => el("li", {}, s.text, el("span", {class: "src"}, `[${s.sources.join(", ")}]`)))),
     evidence.length ? el("div", {}, el("b", {}, "Warning signs in the chat"), el("ul", {class: "sentences"}, evidence)) : null,
+    el("div", {}, el("b", {}, "What to do"), el("ol", {class: "sentences"}, r.steps.map((s) => el("li", {}, s)))),
+    el("p", {}, "Still unsure? Vendor Guard can't act on a payment, but PayPal can. ",
+      el("a", {href: CONTACT_PAYPAL, target: "_blank", rel: "noopener"}, "Contact PayPal")),
     r.template ? el("p", {class: "caveat"}, "These are fixed sentences: the model's explanation didn't pass the evidence checks.") : null,
     r.signals_checked ? null : el("p", {class: "caveat"}, "The chat could not be checked for scam patterns, so this verdict leans on PayPal alone."),
     el("p", {class: "caveat"}, `Case ${r.case_id}.`),

@@ -246,7 +246,8 @@ def check(state):
     except Exception as e:
         log.warning("check failed: %s", type(e).__name__)
         return _say(CHECK_FAILED, awaiting=None, price=None)
-    lines = [f"{out['verdict']}: {out['message']}", *(s["text"] for s in out["sentences"]), f"Case {out['case_id']}"]
+    lines = [f"{out['verdict']}: {out['message']}", *(s["text"] for s in out["sentences"]), "What to do:",
+             *(f"{n}. {s}" for n, s in enumerate(out["steps"], 1)), out["support"], f"Case {out['case_id']}"]
     return _say("\n".join(lines), awaiting=None, price=None)  # never the evidence: it holds the buyer's quotes
 
 

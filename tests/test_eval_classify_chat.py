@@ -8,17 +8,14 @@ sent to Groq.
 """
 import json
 import os
-import time
 from collections import defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
 
-import groq
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
-from app import chat, llm
-from tests.test_eval_output_guardrails import KEY, real_llm  # noqa: F401  (real_llm is an autouse fixture)
+from app import chat
+from tests.test_eval_output_guardrails import KEY, calls, real_llm, save_results  # noqa: F401  (pytest fixtures)
 
 pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason="needs GROQ_API_KEY in .env")]
 
@@ -60,41 +57,7 @@ def kpis(rows) -> str:
 def results():
     yield
     if ROWS:
-        (out := HERE / "eval_results").mkdir(exist_ok=True)
-        path = out / f"chat-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.jsonl"
-        path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in ROWS))
-        path.with_suffix(".txt").write_text(f"{(report := kpis(ROWS))}\n")
-        print(f"\n\n{report}\nreplies saved to {path}")
-
-
-@pytest.fixture
-def calls(monkeypatch):
-    """Each completion's total tokens, each 429 waited out, and the type of each failed llm.ask (classify then falls
-    back to other). No SDK retries, as in the app: a 429 waits a minute, the free tier's window, and tries once more."""
-    seen, limited, failed = [], [], []
-    monkeypatch.setattr(llm, "client", llm.client.with_options(max_retries=0))  # after real_llm (autouse)
-    create, ask = llm.client.chat.completions.create, llm.ask
-
-    def record(**kwargs):
-        try:
-            r = create(**kwargs)
-        except groq.RateLimitError:
-            limited.append(1)
-            time.sleep(60)
-            r = create(**kwargs)
-        seen.append(r.usage.total_tokens)
-        return r
-
-    def record_ask(*args, **kwargs):  # also catches what fails after a completion: a cut-off or invalid answer
-        try:
-            return ask(*args, **kwargs)
-        except Exception as e:
-            failed.append(type(e).__name__)
-            raise
-
-    monkeypatch.setattr(llm.client.chat.completions, "create", record)
-    monkeypatch.setattr(llm, "ask", record_ask)
-    return seen, limited, failed
+        save_results("chat", ROWS, kpis(ROWS))
 
 
 @pytest.mark.parametrize("i, rep", [(i, rep) for i in range(1, len(CASES) + 1) for rep in range(REPS)],

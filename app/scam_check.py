@@ -46,8 +46,85 @@ POLICY = {  # the instruction to the seller, inserted verbatim by code
     "P.WAIT_NOT_CONFIRMED": "Not confirmed. Check your PayPal Activity for this payment before you ship.",
 }
 MONEY_OUT_WARNING = "Never send money, pay a fee or enter card details to receive a payment."
+# PayPal's US Contact Us page (live chat with a person), checked 2026-10-25; the region is policy_pack.REGION's
+CONTACT_PAYPAL = "https://www.paypal.com/us/cshelp/contact-us"
+SUPPORT = f"Still unsure? Vendor Guard can't act on a payment, but PayPal can. Contact PayPal: {CONTACT_PAYPAL}"
 
-PAYMENT_TEMPLATE = {  # safe_template's sentence about E1, per payment status
+# the seller's next steps, shown verbatim after the instruction. PayPal facts come from policy_pack's verified notes
+SHIP = ("Ship only to the address on this payment's Transaction Details page in PayPal.",
+        "Use your own shipping account, never a label or courier from the buyer.",
+        "Add the tracking number to this payment in PayPal.",
+        "Keep the tracking and the proof of delivery.")
+NEW_ID = "Ask the buyer for the transaction ID of the payment for this order."
+STEPS = {  # policy_id: (label, what PayPal showed, next steps)
+    "P.VERIFIED": (
+        "VERIFIED", "PayPal has a completed payment of your price, and the chat showed no warning signs.", SHIP,
+    ),
+    "P.VERIFIED_WARN": (
+        "VERIFIED_WITH_WARNINGS", "PayPal has a completed payment of your price, but the chat showed warning signs, "
+        "or couldn't be checked for them.",
+        SHIP + ("Don't refund or pay anything outside PayPal, whatever the buyer asks.",),
+    ),
+    "P.SCAM_LIKELY": (
+        "SCAM_LIKELY", "PayPal can't find this payment, and the chat shows at least two warning signs.",
+        ("Don't ship.", "Don't send money, pay a fee, open the buyer's links or move to another app.",
+         "Look for the payment in your PayPal Activity. If it isn't there, you weren't paid, whatever an email or "
+         "screenshot says.",
+         "If you already shipped, contact PayPal now."),
+    ),
+    "P.WAIT_NOT_PAID": (
+        "Not paid", "PayPal shows the payment as declined, failed or refunded, so no money reached you.",
+        ("Don't ship.", "If the buyer still wants the item, ask them to pay again in PayPal.",
+         "Check the new payment before you ship."),
+    ),
+    "P.WAIT_WRONG_AMOUNT": (
+        "Wrong amount", "PayPal has the payment, but for a different amount or currency than your price.",
+        ("Make sure the price you gave Vendor Guard is right. If it wasn't, check again with the right one.",
+         "If the buyer paid more and asks you to send the difference back, don't send anything: that is how the "
+         "overpayment scam works.",
+         "To fix an honest mistake, refund the whole payment in PayPal, then ask the buyer to pay your exact price.",
+         "Never settle a difference outside PayPal."),
+    ),
+    "P.WAIT_NOT_CLEARED": (
+        "Not completed yet", "PayPal has the payment, but it isn't completed yet, for example it is pending.",
+        ("Wait until it shows as Completed in your PayPal Activity.", "Then check it again before you ship."),
+    ),
+    "P.WAIT_TOO_OLD": (
+        "Too old", "PayPal has the payment, but it is more than 14 days old.",
+        (NEW_ID, "Check that one before you ship."),
+    ),
+    "P.WAIT_REUSED": (
+        "Already used", "PayPal has the payment, but Vendor Guard already used it to approve another order.",
+        ("One payment pays for one order.", NEW_ID, "Check that one before you ship."),
+    ),
+    "P.WAIT_NOT_CONFIRMED": (
+        "Not confirmed", "Vendor Guard couldn't find the payment in PayPal, or couldn't finish checking it.",
+        ("Look for a payment from this buyer in your PayPal Activity.",
+         "A transaction ID that PayPal can't find is not proof of a scam: PayPal gives the buyer and the seller "
+         "different transaction IDs for the same payment."),
+    ),
+}
+SIGNAL_STEPS = {  # one more step per warning sign found, quote confirmed or not, in SIGNALS' order
+    "OVERPAYMENT_REFUND": "Don't send any difference back: that is how the overpayment scam works.",
+    "FAKE_PAYMENT_PROOF": "Don't trust emails or screenshots as proof: a payment counts only if you see it in your "
+    "PayPal Activity.",
+    "PAYMENT_HELD_UNTIL_TRACKING": "Check the payment's status yourself in your PayPal Activity, not in the buyer's "
+    "messages.",
+    "THIRD_PARTY_SHIPPING": "Don't ship to another address or a forwarder, and don't use the buyer's courier or label.",
+    "UPFRONT_FEE": "Don't pay any fee to receive a payment.",
+    "URGENCY_PRESSURE": "Take your time: a real buyer can wait while you check.",
+    "OFF_PLATFORM": "Keep talking where you sell, so there is a record, not on WhatsApp, email or phone.",
+    "UNPROTECTED_PAYMENT": "Take only a PayPal payment for goods and services: Friends and Family isn't covered by "
+    "Seller Protection, and gift cards, crypto, wire transfers and MB WAY aren't PayPal.",
+    "PAYMENT_LINK": "Don't open the buyer's link: log in to PayPal yourself to see a payment.",
+}
+
+
+def steps(policy_id: str, signals: list[dict] | None) -> list[str]:
+    found = {s["type"] for s in signals or []}
+    return [*STEPS[policy_id][2], *(SIGNAL_STEPS[t] for t in SIGNALS if t in found)]
+
+PAYMENT_TEMPLATE = {  # the sentence about E1, per payment status: always code's, never the model's
     "FOUND": "PayPal shows this payment as {{E1.paypal_status}} for {{E1.amount}} {{E1.currency}}; "
     "the expected amount is {{E1.expected_amount}} {{E1.expected_currency}}.",
     "NOT_FOUND": "PayPal has no record of the transaction IDs in this chat.",
@@ -64,7 +141,7 @@ SEARCH_STATUS = {"S": "COMPLETED", "P": "PENDING", "D": "DECLINED", "V": "REVERS
 SEARCH_RANK = {"V": 0, "D": 1, "P": 2, "S": 4}  # worst first; an unknown code ranks 3, below S
 MAX_AGE = timedelta(days=14)  # older payments are most likely from an earlier order
 NOT_PAID = {"DECLINED", "FAILED", "REFUNDED", "PARTIALLY_REFUNDED", "REVERSED"}
-LLM_VISIBLE = {"status", "paypal_status", "source", "amount_check", "type", "label", "confirmed"}  # code-made only
+LLM_VISIBLE = {"type", "label", "confirmed"}  # code-made only
 
 SignalsOut = create_model(  # one nullable quote per signal type: bounded output, strict-mode friendly
     "SignalsOut", __config__=ConfigDict(extra="forbid"), **{k.lower(): (str | None, ...) for k in SIGNALS}
@@ -98,11 +175,11 @@ SIGNALS_PROMPT = (
     + "\nA real PayPal hold appears only inside the seller's PayPal account, so the word 'hold' alone is not a pattern."
 )
 EXPLAIN_PROMPT = (
-    "You explain a payment check to an online seller in 1 to 3 short English sentences. "
-    "The decision and the instruction to the seller are already shown; do not repeat them, give advice, "
-    "or tell the seller what to do. Write in the third person about PayPal, the payment and the chat; "
-    "never address the seller as 'you'. Explain only what the evidence below shows. "
-    "Write facts only as the placeholders listed, such as {{E1.amount}}: never write numbers, dates, amounts, "
+    "You explain the warning signs found in a buyer's chat to an online seller in 1 to 3 short English sentences. "
+    "The decision, the instruction to the seller and a sentence about the payment are already shown; do not repeat "
+    "them, write about the payment, give advice, or tell the seller what to do. Write in the third person about "
+    "the chat; never address the seller as 'you'. Explain only what the evidence below shows. "
+    "Write facts only as the placeholders listed: never write numbers, dates, amounts, "
     "ids, currencies, links or email addresses yourself. Describe a warning sign only as {{Ek.label}}. "
     "Never use the words ship, send, post, deliver, release or guarantee. "
     "List in sources the evidence ids each sentence uses. Use intent ADMIT_MISSING for what could not be checked."
@@ -324,9 +401,10 @@ def compute_verdict(state):
 
 
 def _explain_input(state) -> str:
-    """What explain_and_reply sees: code-made values and placeholder names, never buyer text."""
+    """What explain_and_reply sees: code-made values and placeholder names, never buyer text. The warning signs
+    only: the sentence about the payment (E1) is code's, so the model can't word it against the verdict."""
     lines = [f"Decision: {state['verdict']}. Instruction already shown to the seller: {POLICY[state['policy_id']]}"]
-    for eid, item in state["evidence"].items():
+    for eid, item in _signal_evidence(state["evidence"]).items():
         shown = {k: v for k, v in item.items() if k in LLM_VISIBLE}
         names = ", ".join(f"{{{{{eid}.{k}}}}}" for k in item if k not in output_guardrails.NOT_FILLABLE)
         lines.append(f"{eid}: {shown}; placeholders: {names}")
@@ -335,6 +413,8 @@ def _explain_input(state) -> str:
 
 @owns("draft")
 def explain_and_reply(state):
+    if not _signal_evidence(state["evidence"]):  # nothing for the model to explain: no warning signs, or unknown
+        return {"draft": []}
     try:
         return {"draft": llm.ask(Draft, EXPLAIN_PROMPT, _explain_input(state)).sentences}
     except Exception as e:  # an empty draft fails validation, so the seller gets the template
@@ -346,22 +426,31 @@ def _reply(state, sentences: list[dict], template: bool) -> dict:
     message = POLICY[state["policy_id"]]
     if any(s["type"] in MONEY_OUT for s in state.get("signals") or []):
         message += " " + MONEY_OUT_WARNING
-    return {"message": message, "sentences": sentences, "template": template}
+    return {"message": message, "sentences": sentences, "template": template,
+            "steps": steps(state["policy_id"], state.get("signals")), "support": SUPPORT}
 
 
 @owns("reply", "guardrail_errors")
 def validate_output(state):
-    if errors := output_guardrails.validate(state["draft"], state["evidence"]):
+    draft, evidence = state["draft"], state["evidence"]
+    # checked without E1, a model sentence about the payment fails: a grounded one could still contradict the
+    # verdict ("{{E1.amount}}, in line with {{E1.expected_amount}}"). Up to 3, so the reply stays within 4
+    signals = _signal_evidence(evidence)
+    if (draft or signals) and (errors := output_guardrails.validate(draft, signals, most=3)):
         return {"guardrail_errors": errors}
-    sentences = output_guardrails.render(state["draft"], state["evidence"])
+    sentences = output_guardrails.render(template_sentences(evidence)[:1] + draft, evidence)
     return {"guardrail_errors": [], "reply": _reply(state, sentences, template=False)}
+
+
+def _signal_evidence(evidence: dict) -> dict:
+    return {k: v for k, v in evidence.items() if k != "E1"}
 
 
 def template_sentences(evidence: dict) -> list[output_guardrails.Sentence]:
     """Fixed sentences, no LLM. Each must pass output_guardrails.validate (tested)."""
     sentences = [output_guardrails.Sentence(intent="EXPLAIN_PAYMENT", text=PAYMENT_TEMPLATE[evidence["E1"]["status"]],
                                     sources=["E1"])]
-    if signal_ids := [k for k in evidence if k != "E1"]:
+    if signal_ids := list(_signal_evidence(evidence)):
         labels = "; ".join(f"{{{{{k}.label}}}}" for k in signal_ids)
         sentences.append(output_guardrails.Sentence(intent="EXPLAIN_SIGNAL", text=f"Warning signs in the chat: {labels}.",
                                             sources=signal_ids))
@@ -394,6 +483,8 @@ def result(state) -> dict:
         "verdict": state["verdict"],
         "message": reply["message"],
         "sentences": reply["sentences"],
+        "steps": reply["steps"],
+        "support": reply["support"],
         "evidence": state["evidence"],
         "template": reply["template"],
         "signals_checked": state.get("signals") is not None,

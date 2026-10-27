@@ -5,7 +5,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 PLACEHOLDER = re.compile(r"\{\{\s*(E\d+)\.([a-z_]+)\s*\}\}")
-NOT_FILLABLE = {"quote"}  # buyer text never goes into a sentence
+# buyer text never goes into a sentence; amount_check is a bare "matches"/"differs" that read as "differs the"
+NOT_FILLABLE = {"quote", "amount_check"}
 SOURCE_ID = re.compile(r"\bE\d+\b")
 # anything outside plain ASCII and Latin letters: superscripts, homoglyphs, soft hyphens, full-width forms
 BAD_CHAR = re.compile(r"[^\x20-\x7eÀ-ſ«»‘’“”–—…]|[<>\[\]@]")
@@ -30,10 +31,10 @@ class Sentence(BaseModel):
     sources: list[str]
 
 
-def validate(sentences: list[Sentence], evidence: dict[str, dict]) -> list[str]:
+def validate(sentences: list[Sentence], evidence: dict[str, dict], most: int = 4) -> list[str]:
     """Every reason the sentences can't be shown. Empty list = grounded."""
-    if not 1 <= len(sentences) <= 4:
-        return [f"{len(sentences)} sentences, need 1 to 4"]
+    if not 1 <= len(sentences) <= most:
+        return [f"{len(sentences)} sentences, need 1 to {most}"]
     errors = []
     for i, s in enumerate(sentences):
         if len(s.text) > 280:

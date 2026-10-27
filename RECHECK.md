@@ -6,6 +6,8 @@ This file is a to-do list: when a point is fixed, delete it and note the fix in 
 
 Authentication and authorization are still being built, so some of these may no longer apply once that lands. Where I think a point depends on the auth work, I tagged it **(depends on auth)**. That tag is my guess, not the reviewer's.
 
+Points marked with \* are important: do them first.
+
 ## Config and deploy
 
 - [ ] **14. No `ipAllowList` on the free Postgres, and the free tier is not durable.** [render.yaml:1](render.yaml#L1)
@@ -42,22 +44,18 @@ Authentication and authorization are still being built, so some of these may no 
 
 ## LLM output
 
-- [ ] **15. With signals unknown, the explain step invents a warning sign.** [app/scam_check.py:296](app/scam_check.py#L296)
-  Found by the eval `verified, signals unknown` on 2026-10-21, not by the review. When `detect_signals` fails, `signals` is `None` and the verdict is `VERIFIED_WITH_WARNINGS`, but `_explain_input` never says the chat check failed. The model then cites an `E2` that does not exist ("A warning sign labeled {{E2.label}} could not be verified"). The guardrails reject it, so it is safe, but the seller gets the template instead of an explanation.
-  *Fix:* when `signals is None`, add a line such as "Chat check: could not be done" to `_explain_input`, so the model can write an `ADMIT_MISSING` sentence on `E1`. Then remove the `xfail` on that eval case.
-  *Next:* build a LangSmith dataset from the eval cases and score the explanations with an LLM-as-judge (does each sentence match the evidence and verdict?). The current evals only check the rules in `output_guardrails`, not whether the wording is true.
-
 - [ ] **25. The explanation reads badly around signal labels.** [app/scam_check.py](app/scam_check.py)
-  Added 2026-10-24, from a live run of the demo's fake-email chat. The labels are verb phrases written for "the buyer …" ("offers an email or screenshot as proof…"), and the model put them where a noun goes: "The buyer provides FAKE_PAYMENT_PROOF which is a offers an email…", "The communication includes a says the money is released only after…". The guardrails pass it (it is grounded), so the seller sees it. It also wrote "PayPal shows the payment status as UNAVAILABLE" when Transaction Search answered 403, which reads as if the payment itself were unavailable.
-  *Fix:* a graph change, so plan it first: either tell `EXPLAIN_PROMPT` that `{{Ek.label}}` follows "the buyer", or give each signal a noun-phrase label for the LLM. Then add an eval case that checks the wording, as #15's *Next* suggests.
+  Added 2026-10-24, from a live run of the demo's fake-email chat. The labels are verb phrases written for "the buyer …" ("offers an email or screenshot as proof…"), and the model put them where a noun goes: "The buyer provides FAKE_PAYMENT_PROOF which is a offers an email…", "The communication includes a says the money is released only after…". The guardrails pass it (it is grounded), so the seller sees it.
+  Eval runs on 2026-10-25 show it in most explanations: "The buyer mentions says they paid too much…", "which is a warning sign rushes or threatens you", "The buyer claims OVERPAYMENT_REFUND and…", "The buyer PAYMENT_LINK sends a link… yes." (the model filled `{{E2.type}}` and `{{E2.confirmed}}`). The template's "Warning signs in the chat: a; b." reads better than most of them.
+  *Fix:* a graph change, so plan it first. Either tell `EXPLAIN_PROMPT` that `{{Ek.label}}` follows "the buyer", give each signal a noun-phrase label for the LLM, or drop the model from the explanation and always use the template. Then score the E07 replies with an LLM-as-judge (does each sentence read well and match the evidence?): its KPIs only check the rules in `output_guardrails`, not the wording.
 
 - [ ] **16. Nobody measures whether `detect_signals` catches real scams.** [app/scam_check.py:183](app/scam_check.py#L183)
-  Added 2026-10-21, from a design discussion, not the review. The evals in `tests/test_eval_output_guardrails.py` only test the explanation. The signals never decide `VERIFIED` (PayPal does), but they decide `SCAM_LIKELY` and the warnings, and their recall and false-alarm rate are unknown.
+  Added 2026-10-21, from a design discussion, not the review. No eval scores `detect_signals` on its own. The signals never decide `VERIFIED` (PayPal does), but they decide `SCAM_LIKELY` and the warnings, and their recall and false-alarm rate are unknown.
   *Fix:* an opt-in eval (`pytest -m eval`) with 30–40 made-up but realistic chats in PT and EN: OLX/Vinted scams, MB WAY, "paguei a mais", own courier, fake PayPal emails, plus honest buyers. Check the expected signal types and `confirmed` per chat, and report recall and false alarms per signal. A second LLM reviewing the first is not the fix: it reads the same buyer text, so the same injection fools both.
   *2026-10-21:* screenshots add a copy step before `detect_signals`. With a screenshot, `confirmed` means "in the model's copy", not "in the image". Run the same chats as screenshots too: `screenshot()` in `tests/test_eval_screenshot.py` draws them. Add real phone screenshots (WhatsApp, OLX, Vinted, dark mode) and photos of a screen, since the drawn ones are clean.
 
 - [ ] **17. Consider Jev (TypeSafe AI) for `detect_signals`.**
-  Added 2026-10-21, an idea, not a finding. Jev does not generate text: it takes a state and typed questions (yes/no, rubric, multiple choice) and returns probabilities. That matches `detect_signals` (one yes/no per signal type) and would give a tunable threshold instead of a quote or null. It can also act as the judge for #15 *Next*. It is reachable from Pydantic AI (`typesafe:jev-latest`), DeepEval and Promptfoo.
+  Added 2026-10-21, an idea, not a finding. Jev does not generate text: it takes a state and typed questions (yes/no, rubric, multiple choice) and returns probabilities. That matches `detect_signals` (one yes/no per signal type) and would give a tunable threshold instead of a quote or null. It can also act as the judge for #25. It is reachable from Pydantic AI (`typesafe:jev-latest`), DeepEval and Promptfoo.
   *Before deciding:* run it on the #16 eval and compare it with the current Groq model. Check pricing and data handling in TypeSafe's own docs, because buyer chats would be sent to a new vendor. Pin a version (`jev-1.13.0`-style) if a threshold is tuned. It returns no quote, so the `confirmed` check that stops invented quotes would need a replacement.
 
 ## Chat
@@ -94,3 +92,17 @@ Authentication and authorization are still being built, so some of these may no 
   - an image that isn't PNG or JPEG, and two images;
   - EN and PT.
   Draw the screenshots with Pillow, as `tests/test_eval_screenshot.py` does, or use the demo's "Buyer's receipt" and "Seller's receipt". Run it like the E06 eval, and fix #26 against it.
+
+- [ ] \* **28. "What does WAIT mean?" gives a generic list, not the reason for the seller's own check.** [app/policy_pack.py:39](app/policy_pack.py#L39)
+  Added 2026-10-25, from a live test on `/demo`: a payment that was `COMPLETED` but for a different amount than the price got WAIT, and the seller asked the chat why. The reply is the `vg_why_wait` note: every `P.WAIT_*` instruction joined into one paragraph. Some of them mean nothing on their own ("Don't ship yet." is the PENDING reason, but it never says "pending"). The chat also can't know the seller's case. The demo's check panel runs `scam_check` outside the chat graph, and a check run in the chat leaves no case in the chat state.
+  Step 1 is done (see CHANGES.md): one note per reason, with next steps. The chat finds the right one only if the seller names the reason or pastes the WAIT card's sentence.
+  *Fix still to do:* make the chat answer about the seller's last case: "WAIT because PayPal shows X USD and you asked for Y USD." This needs the case in the chat state (for example `case_id`, written by `check` and by the demo's check panel), read from the stored case's evidence. It is a graph change, so plan it first.
+
+- [ ] **29. No dataset to see the outcome and the next steps the chat gives.** [app/scam_check.py:59](app/scam_check.py#L59)
+  Added 2026-10-25, after `STEPS` and `SIGNAL_STEPS`. U16 and S02 check that every policy id and signal has its steps, not that a real case gets the right ones. #27 scores the chat's flow and #16 the signals; this one scores what the seller is told to do at the end.
+  *To do:* a dataset of cases, each a PayPal answer (mocked, as in `tests/test_scam_check.py`), a price and a buyer chat, with the expected policy id, the steps shown and the follow-up in the chat:
+  - every policy id at least once, and the wrong amount both higher and lower than the price;
+  - each warning sign alone, and two or three together, so the order and number of extra steps can be seen;
+  - after the check, the seller asks "what do I do now?", "can I ship?", "o que faço agora?" or pastes the card's sentence: the reply should give the same steps as the card, through the matching `vg_*` note;
+  - EN and PT.
+  Save each run's verdict, steps, support line and chat reply to `tests/eval_results/`, so the outcomes can be read side by side. Read the first run by hand before scoring anything: are the steps right for the case, in a sensible order, and not too many?

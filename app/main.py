@@ -1,3 +1,5 @@
+import base64
+import binascii
 import json
 import logging
 import os
@@ -5,9 +7,6 @@ from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import Context
 from decimal import Decimal
 from functools import partial
-
-import base64
-import binascii
 from typing import Annotated
 
 import anyio

@@ -30,7 +30,7 @@ COMPLETED = {"id": TID, "status": "COMPLETED", "amount": {"value": "25.00", "cur
 PAID = f"Olá! Já paguei pelo PayPal, o ID é {TID}."
 SCAM_CHAT = PAID + " Preciso que envie hoje sem falta! Fala comigo no WhatsApp."
 TWO_SIGNALS = {"urgency_pressure": "Preciso que envie hoje sem falta", "off_platform": "Fala comigo no WhatsApp"}
-GOOD_DRAFT = [Sentence(intent="EXPLAIN_PAYMENT", text="PayPal reports this payment as {{E1.status}}.", sources=["E1"])]
+GOOD_DRAFT = [Sentence(intent="EXPLAIN_SIGNAL", text="In the chat, the buyer {{E2.label}}.", sources=["E2"])]
 GROQ = "https://api.groq.com/openai/v1/chat/completions"
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(8)  # the app checks only the first bytes; the vision call is mocked
 JPEG = b"\xff\xd8\xff\xe0" + bytes(8)
@@ -291,16 +291,42 @@ def test_n03_a_failed_signal_check_never_gives_scam_likely(api, llm_stub, saved)
     assert run(SCAM_CHAT)["verdict"] == "WAIT"
 
 
+WRONG_AMOUNT = COMPLETED | {"amount": {"value": "25.01", "currency_code": "EUR"}}
+
+
+WRONG_AMOUNT_TEXT = "PayPal shows this payment as COMPLETED for 25.01 EUR; the expected amount is 25.00 EUR."
+SAYS_THEY_MATCH = Sentence(intent="EXPLAIN_PAYMENT", sources=["E1"], text="PayPal shows {{E1.amount}} {{E1.currency}}, "
+                           "in line with {{E1.expected_amount}} {{E1.expected_currency}}.")
+
+
 @pytest.mark.parametrize("draft", [
     RuntimeError("groq down"),
-    [Sentence(intent="EXPLAIN_PAYMENT", text="The buyer paid 25 EUR.", sources=["E1"])],
-], ids=["llm error", "ungrounded draft"])
+    [Sentence(intent="EXPLAIN_SIGNAL", text="The buyer paid 25 EUR.", sources=["E2"])],
+    [SAYS_THEY_MATCH, *GOOD_DRAFT],  # grounded, yet contradicts the WAIT: the model may not write about E1
+    GOOD_DRAFT * 4,  # with the payment sentence that would be 5
+], ids=["llm error", "ungrounded draft", "about the payment", "four sentences"])
 def test_n04_a_bad_explanation_falls_back_to_the_template(api, llm_stub, saved, draft):
-    capture(api, httpx.Response(200, json=COMPLETED))
-    llm_stub.draft = draft
+    capture(api, httpx.Response(200, json=WRONG_AMOUNT))
+    llm_stub.signals, llm_stub.draft = TWO_SIGNALS, draft
+    out = run(SCAM_CHAT)
+    assert out["verdict"] == "WAIT" and out["template"] is True
+    assert [s["text"] for s in out["sentences"]] == [WRONG_AMOUNT_TEXT, "Warning signs in the chat: "
+                                                     + "; ".join(e["label"] for k, e in out["evidence"].items() if k != "E1") + "."]
+
+
+def test_n04_code_writes_the_payment_sentence_and_the_model_the_signals(api, llm_stub, saved):
+    capture(api, httpx.Response(200, json=WRONG_AMOUNT))
+    llm_stub.signals = TWO_SIGNALS
+    out = run(SCAM_CHAT)
+    assert out["template"] is False
+    assert [s["text"] for s in out["sentences"]] == [WRONG_AMOUNT_TEXT, f"In the chat, the buyer {out['evidence']['E2']['label']}."]
+
+
+def test_n04_without_warning_signs_the_model_is_not_asked(api, llm_stub, saved):
+    capture(api, httpx.Response(200, json=WRONG_AMOUNT))
+    llm_stub.draft = RuntimeError("must not be called")  # would give template=True
     out = run()
-    assert out["verdict"] == "VERIFIED" and out["template"] is True
-    assert out["sentences"][0]["text"] == "PayPal shows this payment as COMPLETED for 25.00 EUR; the expected amount is 25.00 EUR."
+    assert out["template"] is False and [s["text"] for s in out["sentences"]] == [WRONG_AMOUNT_TEXT]
 
 
 def test_n04_database_down_still_returns_the_verdict(api, llm_stub, monkeypatch):
@@ -356,6 +382,9 @@ def test_s02_unverifiable_quotes_still_block_verified(api, llm_stub, saved):
     out = run()
     assert out["verdict"] == "VERIFIED_WITH_WARNINGS"
     assert out["message"].endswith(scam_check.MONEY_OUT_WARNING)
+    # the outcome's steps, then one per warning sign, even with its quote unconfirmed
+    assert out["steps"] == [*scam_check.STEPS["P.VERIFIED_WARN"][2], scam_check.SIGNAL_STEPS["OVERPAYMENT_REFUND"]]
+    assert out["support"] == scam_check.SUPPORT
 
 
 def completion(content, finish="stop"):
@@ -379,7 +408,7 @@ def test_s03_prompts_hold_no_tools_no_secrets_and_explain_sees_no_buyer_text(api
         if body["response_format"]["json_schema"]["name"] == "SignalsOut":
             quotes = {k.lower(): None for k in scam_check.SIGNALS} | {"urgency_pressure": f"{canary} hurry up please"}
             return completion(json.dumps(quotes))
-        sentence = {"intent": "EXPLAIN_PAYMENT", "text": "PayPal reports {{E1.status}}.", "sources": ["E1"]}
+        sentence = {"intent": "EXPLAIN_SIGNAL", "text": "In the chat, the buyer {{E2.label}}.", "sources": ["E2"]}
         return completion(json.dumps({"sentences": [sentence]}))
 
     groq = api.post(GROQ).mock(side_effect=reply)
@@ -427,8 +456,9 @@ def test_s03_ask_rejects_truncated_output(api):
 def test_s04_the_llm_cannot_tell_the_seller_to_ship(api, llm_stub, saved, text):
     capture(api, httpx.Response(404))
     search(api)
-    llm_stub.draft = [Sentence(intent="EXPLAIN_PAYMENT", text=text, sources=["E1"])]
-    out = run()
+    llm_stub.signals = {"urgency_pressure": "Preciso que envie hoje sem falta"}
+    llm_stub.draft = [Sentence(intent="EXPLAIN_SIGNAL", text=text, sources=["E2"])]
+    out = run(SCAM_CHAT)
     assert out["template"] is True and out["message"] == scam_check.POLICY["P.WAIT_NOT_CONFIRMED"]
 
 
@@ -451,8 +481,8 @@ def test_api_returns_only_the_result(api, llm_stub, saved):
     capture(api, httpx.Response(200, json=COMPLETED))
     r = client.post("/scam-check", json=BODY | {"text": PAID})
     assert r.status_code == 200
-    assert set(r.json()) == {"case_id", "verdict", "message", "sentences", "evidence", "template",
-                             "signals_checked", "persisted"}
+    assert set(r.json()) == {"case_id", "verdict", "message", "sentences", "steps", "support", "evidence",
+                             "template", "signals_checked", "persisted"}
     assert r.json()["verdict"] == "VERIFIED" and r.json()["persisted"] is True
 
 
@@ -482,7 +512,6 @@ def test_screenshot_and_pasted_text_are_one_chat(api, llm_stub, saved):
     pytest.param({}, id="neither text nor screenshot"),
     pytest.param({"text": ""}, id="empty text"),
     pytest.param({"image": b64(b"%PDF-1.7 not an image")}, id="a pdf"),
-    pytest.param({"image": "data:image/png;base64," + b64(PNG)}, id="a data url"),
     pytest.param({"image": b64(PNG + bytes(3_000_000))}, id="over 3 MB"),
     pytest.param({"image": b64(PNG).replace("+", "-").replace("/", "_") + "-_"}, id="url-safe base64"),
 ])
@@ -493,7 +522,7 @@ def test_api_rejects_a_bad_screenshot_request(extra):
 
 def test_api_says_a_data_url_is_not_plain_base64():
     r = client.post("/scam-check", json=BODY | {"image": "data:image/png;base64," + b64(PNG)})
-    assert "no data: prefix" in r.json()["detail"][0]["msg"]
+    assert r.status_code == 422 and "no data: prefix" in r.json()["detail"][0]["msg"]
 
 
 def test_api_checks_the_size_before_decoding(monkeypatch):
