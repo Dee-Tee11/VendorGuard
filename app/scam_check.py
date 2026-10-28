@@ -120,8 +120,16 @@ SIGNAL_STEPS = {  # one more step per warning sign found, quote confirmed or not
 }
 
 
+# a warning sign's step that the outcome's own steps already say: shown twice, it read as a repeat (E07 case 20)
+COVERED = {
+    "P.WAIT_WRONG_AMOUNT": {"OVERPAYMENT_REFUND"},
+    "P.VERIFIED_WARN": {"THIRD_PARTY_SHIPPING"},  # SHIP: the Transaction Details address, never the buyer's label
+    "P.SCAM_LIKELY": {"OVERPAYMENT_REFUND", "UPFRONT_FEE", "PAYMENT_LINK", "FAKE_PAYMENT_PROOF"},
+}
+
+
 def steps(policy_id: str, signals: list[dict] | None) -> list[str]:
-    found = {s["type"] for s in signals or []}
+    found = {s["type"] for s in signals or []} - COVERED.get(policy_id, set())
     return [*STEPS[policy_id][2], *(SIGNAL_STEPS[t] for t in SIGNALS if t in found)]
 
 PAYMENT_TEMPLATE = {  # the sentence about E1, per payment status: always code's, never the model's
@@ -180,7 +188,9 @@ EXPLAIN_PROMPT = (
     "them, write about the payment, give advice, or tell the seller what to do. Write in the third person about "
     "the chat; never address the seller as 'you'. Explain only what the evidence below shows. "
     "Write facts only as the placeholders listed: never write numbers, dates, amounts, "
-    "ids, currencies, links or email addresses yourself. Describe a warning sign only as {{Ek.label}}. "
+    "ids, currencies, links or email addresses yourself. Describe a warning sign only as {{Ek.label}}: it is a "
+    "verb phrase, so write it right after 'the buyer', as in 'The buyer {{E2.label}}.', and join two with 'and'. "
+    "Never write a warning sign's type name. "
     "Never use the words ship, send, post, deliver, release or guarantee. "
     "List in sources the evidence ids each sentence uses. Use intent ADMIT_MISSING for what could not be checked."
 )
@@ -481,6 +491,7 @@ def result(state) -> dict:
     return {
         "case_id": state["case_id"],
         "verdict": state["verdict"],
+        "policy_id": state["policy_id"],  # code's rule id: the chat's "what do I do now?" reads it
         "message": reply["message"],
         "sentences": reply["sentences"],
         "steps": reply["steps"],

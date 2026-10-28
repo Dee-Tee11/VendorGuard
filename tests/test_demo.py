@@ -181,7 +181,7 @@ def say(h, message):
 
 
 def test_d12_a_question_is_routed_and_answered_from_a_verified_note(demo_db, choice):
-    key = next(iter(chat.VERIFIED))
+    key = "vg_why_wait"
     choice.intent, choice.entries = "question", [key]
     r = say(start(), "What does WAIT mean?").json()
     assert r["route"] == "question" and r["intent"] == "question" and r["notes"] == [key]
@@ -245,8 +245,8 @@ def test_d16_a_session_takes_one_message_at_a_time(demo_db, choice):
 def test_d17_a_screenshot_in_the_chat_runs_the_check_and_counts_as_one(demo_db, choice, monkeypatch):
     ran = []
     monkeypatch.setattr(scam_check, "run", lambda *args: ran.append(args) or {
-        "case_id": "c1", "verdict": "WAIT", "message": "m", "sentences": [], "steps": ["s"], "support": "help",
-        "persisted": True})
+        "case_id": "c1", "verdict": "WAIT", "policy_id": "P.WAIT_NOT_CONFIRMED", "message": "m", "sentences": [],
+        "steps": ["s"], "support": "help", "evidence": {"E1": {}}, "persisted": True})
     h, png = start(), "iVBORw0KGgoAAAAAAAAAAA=="
     early = client.post("/demo/api/chat", json={"message": "", "image": png}, headers=h).json()
     assert early["route"] == "start_check" and not ran  # before the price: not read, not a check
@@ -268,3 +268,19 @@ def test_d18_a_screenshot_suggests_a_price_and_never_runs_a_check(demo_db, monke
         {"amount": "12", "currency": "EUR"}, {"amount": "1", "currency": "USD"}]  # only what parse_price accepts
     assert client.post("/demo/api/price", json=png, headers=h).status_code == 429  # 5 an hour: each is a vision call
     assert client.post("/demo/api/price", json=png).status_code == 401
+
+
+def test_d19_the_panels_check_is_the_chats_last_case(api, llm_stub, demo_db):
+    h = start()
+    capture(api, httpx.Response(200, json=USD_PAID))
+    result = lines(client.post("/demo/api/check", json=CHECK, headers=h))[-1]
+    case = demo.chat_graph.get_state(demo._thread(h["X-Demo-Session"])).values["last_case"]
+    assert case == {"case_id": result["case_id"], "policy_id": "P.VERIFIED", "signals": []} and not demo._busy
+
+
+def test_d19_the_panel_and_the_chat_take_turns(api, llm_stub, demo_db):
+    h = start()
+    with demo.busy(h["X-Demo-Session"]):  # a chat message of this session is running
+        assert lines(client.post("/demo/api/check", json=CHECK, headers=h)) == [
+            {"type": "error", "message": "your last message or check is still running, wait for its answer"}]
+    assert not demo._busy

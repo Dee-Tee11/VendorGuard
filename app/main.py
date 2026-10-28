@@ -132,8 +132,18 @@ async def _stream_check(body: ScamCheckIn, session_id: str):
     """The demo's check, as NDJSON: each PayPal call and each node's update as it happens, then the result.
 
     Shows the tester what they sent (the sanitized chat, the screenshot's text, the quotes), which /scam-check never
-    returns. The slot is taken here, not in the route: a generator that never starts would never release it.
+    returns. The session's turn and the slot are taken here, not in the route: the route returns before the stream
+    ends, and a generator that never starts would never release them.
     """
+    try:
+        with demo.busy(session_id):
+            async for line in _checked(body, session_id):
+                yield line
+    except HTTPException as e:  # a chat message of this session is running
+        yield _line("error", message=e.detail)
+
+
+async def _checked(body: ScamCheckIn, session_id: str):
     try:
         SCAM_LIMIT.acquire_nowait()
     except anyio.WouldBlock:
@@ -159,7 +169,9 @@ async def _stream_check(body: ScamCheckIn, session_id: str):
                 if node == "ingest_input":  # stored first, so ending the session deletes this case too
                     await anyio.to_thread.run_sync(db.add_demo_case, session_id, update["case_id"])
                 yield _line("node", node=node, update=update or {})
-        yield _line("result", **scam_check.result(final), persisted=final["persisted"])
+        out = scam_check.result(final)
+        await anyio.to_thread.run_sync(demo.remember_case, session_id, out)
+        yield _line("result", **out, persisted=final["persisted"])
     except scam_check.Unreadable as e:
         yield _line("error", message=str(e))
     except Exception as e:

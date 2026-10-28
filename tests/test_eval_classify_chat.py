@@ -17,7 +17,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from app import chat
 from tests.test_eval_output_guardrails import KEY, calls, real_llm, save_results  # noqa: F401  (pytest fixtures)
 
-pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason="needs GROQ_API_KEY in .env")]
+pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason="needs GROQ_API_KEY_LLM_EVAL in .env")]
 
 HERE = Path(__file__).parent
 CASES = [json.loads(line) for line in (HERE / "chat_dataset.jsonl").read_text().splitlines() if line.strip()]
@@ -83,7 +83,8 @@ def test_eval_classify_chat(monkeypatch, calls, i, rep):
         "intent": intent == want["intent"] if llm_case else None,
         "must": set(want["must"]) <= set(shown) if want["route"] == "question" else None,
         "notes": set(shown) <= set(want["must"] + want["ok"]) if llm_case else None,
-        "calls": len(seen) == llm_case and not failed,
+        # an instruction to Vendor Guard is answered without the LLM (chat.INSTRUCTION), its intent still "other"
+        "calls": len(seen) == (llm_case and not chat.INSTRUCTION.search(chat.sanitize(message["content"]))) and not failed,
     }
     checks = {k: v and error is None if v is not None else None for k, v in checks.items()} | {"ran": error is None}
     ROWS.append({"id": i, "rep": rep, "kind": case["metadata"]["kind"], "lang": case["metadata"]["lang"],

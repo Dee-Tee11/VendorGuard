@@ -387,6 +387,14 @@ def test_s02_unverifiable_quotes_still_block_verified(api, llm_stub, saved):
     assert out["support"] == scam_check.SUPPORT
 
 
+@pytest.mark.parametrize("policy_id, signal", [("P.WAIT_WRONG_AMOUNT", "OVERPAYMENT_REFUND"),
+                                               ("P.VERIFIED_WARN", "THIRD_PARTY_SHIPPING"),
+                                               ("P.SCAM_LIKELY", "PAYMENT_LINK")])
+def test_a_step_the_outcome_already_says_is_not_repeated(policy_id, signal):
+    assert scam_check.steps(policy_id, [{"type": signal}]) == list(scam_check.STEPS[policy_id][2])
+    assert scam_check.SIGNAL_STEPS["OFF_PLATFORM"] in scam_check.steps(policy_id, [{"type": "OFF_PLATFORM"}])
+
+
 def completion(content, finish="stop"):
     return httpx.Response(200, json={
         "id": "c", "object": "chat.completion", "created": 0, "model": llm.MODEL,
@@ -481,7 +489,7 @@ def test_api_returns_only_the_result(api, llm_stub, saved):
     capture(api, httpx.Response(200, json=COMPLETED))
     r = client.post("/scam-check", json=BODY | {"text": PAID})
     assert r.status_code == 200
-    assert set(r.json()) == {"case_id", "verdict", "message", "sentences", "steps", "support", "evidence",
+    assert set(r.json()) == {"case_id", "verdict", "policy_id", "message", "sentences", "steps", "support", "evidence",
                              "template", "signals_checked", "persisted"}
     assert r.json()["verdict"] == "VERIFIED" and r.json()["persisted"] is True
 

@@ -1,5 +1,64 @@
 # Changes
 
+## 2026-10-27: follow-ups quote the note, one closing line, small talk once
+
+A manual review of E07 run seller-20261027T103751Z found four reply-quality problems.
+
+**Chat graph** (`app/chat.py`, planned first; same nodes and routes, still one `classify` request per message)
+- A note shown in the last reply is no longer named with "…: see my last answer". `<previous>` lists that reply's notes sentence by sentence, numbered, and `classify` picks up to 2 numbers in a new `sentences` field (`list[int]`, a new state field it owns). The reply shows the note's title and those sentences word for word. If none answers, the reply is the no-note one: search, or "I don't have that information" and PayPal's link (C19). This brings back the quoting removed earlier the same day, with the first version's failures designed out: see RISKS.md.
+- Vendor Guard's own notes no longer show "Source: README.md#…". PayPal's notes keep their link.
+- A reply ends with at most one closing line: `CHECK_STOPPED` at the price step, else `OFFER_CHECK`, else `SUPPORT` (cut from the end of the `vg_*` notes in the chat). The check is offered only when a note about a payment scam is shown in full for the first time and there was no check: not for an address, a courier or WhatsApp, not on a repeat, not after a check (C21).
+- At most 2 notes per reply, in the classifier's order ("best first" in the prompt). A dispute reply shows the 2 notes `classify` ranked first (it now picks notes for `dispute` too), or the first 2 dispute notes.
+- `other`: the introduction once per thread (new state field `greeted`, owned by `other`: the demo clears `messages` every turn, so they can't tell). After that, one line on what Vendor Guard can help with, or "Glad I could help. Bye!" for thanks and goodbyes (E07 case 34).
+- The hard line breaks in case 2's note were in the reflowed `.txt` only: the run's `.jsonl` and the note's text have none.
+
+**E07**, before (seller-20261027T223642Z) and after (seller-20261028T205351Z), 56 cases, 1 rep: 28 → 30 cases passing everything, judge mean 4.20 → 4.16, safe 54 → 55, no Groq 400s, tokens 151K → 160K. No "see my last answer" and no "README.md#" in the after run. Known gaps: a note with one sentence is quoted whole, so case 16's follow-up repeats it; a wrong first note gets quoted on the follow-up (case 43, the hold note).
+
+## 2026-10-27: no verdict note without a check
+
+E07 cases 35 and 36 showed "VERIFIED: what to do" ("You saw: You can ship") with no check in the conversation, case 18 showed "WAIT, not paid" ("Don't ship") to a seller who had already shipped, and case 37 answered a question about another order with shipping notes. The only guard was the prompt.
+
+**Chat graph** (`app/chat.py`, planned first)
+- `classify` keeps an outcome note (`VERDICT_NOTES`, the "You saw: …" notes) only when it is the last check's own, so it always comes with "About your last check (case …):". `vg_verdicts` says "You can ship" and is dropped when there is no check, until it gets a descriptive text. If nothing is left, the reply is "How to check a payment" (C22).
+- A message that tries to instruct Vendor Guard (`INSTRUCTION`) gets the introduction, with no `classify` call and no context kept for the next message (C23).
+- New intent `another_payment`: after a check, a question about another order gets "Your last check (case …) covered only that payment. To check the other payment, say check." (C24).
+
+**Evals**
+- E07: a rule fails any turn that shows an outcome note's title or "You can ship" with no check of that payment (no `last_case`, or a turn marked `new_payment`, as case 37's last turn).
+- E06: "What verdicts can Vendor Guard give?" now expects "How to check a payment", and the pasted WAIT card no longer expects its outcome note. Instruction messages expect no LLM call.
+
+## 2026-10-27: the chat follows the conversation, after the E07 review
+
+The user scored the 35 E07 conversations by hand (tests/eval_baselines/seller-20261025T193317Z.human.jsonl, mean 3.65 against the judge's 3.85). The main gap: `classify` read only the newest message, so follow-ups like "so what do I do?" got the wrong note or none. The risks of these changes are in RISKS.md.
+
+**Chat graph** (`app/chat.py`, a graph change, planned first)
+- `classify` gets a `<previous>` block: the seller's last message it read, the titles of the notes in the last reply, and the last check's outcome as codes. New state fields `last_question`, `shown` and `last_case`, each owned by the nodes that write them. The buyer's chat, quotes and amounts never enter them (C18).
+- After a check, "what do I do now?" gets that outcome's note, headed "About your last check (case …):". A new check or cancel forgets the last case.
+- A note shown in the last reply is named, not shown again (E07 cases 2, 7 and 11 repeated it word for word).
+- Tried and removed the same day: `classify` picking one sentence of a PayPal note to quote ("PayPal says: …"). With the sentences listed in the prompt, a `classify` call grew from about 850 to 4,200 tokens, the model wrote sentence ids where note keys go (Groq's 400 `json_validate_failed`, 9 times in one E07 run, each falling back to the intro), and "Can I ship that one too?" got "PayPal says: You must ship the item…" (E07 cases 36 and 37, judged unsafe).
+- At the price step, a question goes to `classify`, is answered, and ends the check (E07 case 18 was stuck asking for the price). Anything else still gets "I need the amount…", and a pasted chat never reaches `classify` (C20).
+- "Describing a buyer is not asking for a check" in the prompt, and a reply about a described scam ends with "Want me to check the payment in PayPal? Say check." (C21).
+
+**Notes** (`app/policy_pack.py`)
+- `vg_signal_*`, one per warning sign, from `SIGNAL_STEPS` (with the money-out warning where it applies) and `SUPPORT`: a seller who describes WhatsApp, a fee, pressure or a screenshot as proof now gets the card's step (E07 cases 14, 15, 16, 23).
+- `vg_already_shipped`: look in the PayPal Activity, contact PayPal if the payment isn't there, keep the tracking (E07 case 18).
+
+**Card** (`app/scam_check.py`, `app/output_guardrails.py`)
+- A warning sign's step is left out when the outcome's own steps already say it (`COVERED`): the overpayment step was shown twice on a WAIT for the wrong amount (E07 case 20).
+- The result has `policy_id`, so the chat can keep the outcome.
+- RECHECK #25, in code: `type` and `confirmed` can't be filled into a sentence, a label must follow "the buyer" (or ": ", "; ", "and "), and a signal's code name is rejected. Such a sentence falls back to the template. The prompt says the same.
+
+**Demo**
+- The check panel's outcome becomes the chat's last case. The panel's check now runs under `demo.busy()`, the same per-session lock as a chat message and "End demo", taken inside the stream so it lasts until the check ends: closes RECHECK #24 (D19).
+
+**E07** (`tests/test_eval_seller.py`, `tests/seller_dataset.jsonl`)
+- The judge also scores whether the last reply answers the last message (an earlier good turn no longer hides a bad last one), and knows that asking for the price and the buyer's chat is the check, not a request for personal data (it scored case 3 unsafe for that).
+- A rule fails a reply identical to the previous one. A turn can list notes that must not be shown (`no_notes`).
+- The KPIs show how often the judge is within a point of the user's scores.
+- The evals call Groq with their own keys, `GROQ_API_KEY_LLM_EVAL` for the app's calls and `GROQ_API_KEY_LLM_JUDGE` for the judge, never the app's `GROQ_API_KEY`: the first E07 run after these changes used 255K tokens and hit the free tier's 200K a day. The judge's tokens are no longer in the KPIs.
+- With `LANGSMITH_TRACING=true` in `.env`, the evals are traced to the LangSmith project `vendorguard-evals` (they weren't traced at all: pytest never loaded those variables, only `langgraph dev` does). Each test's traces are sent when it ends. The offline tests stay untraced.
+- Case 20 rewritten (it confused the user), case 30's reference accepts that dispute help isn't ready, and three new cases: an injection in the previous turn, a VERIFIED check followed by a question about another order, and a buyer's line typed at the price step.
+
 ## 2026-10-25: chat on the demo, and the first real payment
 
 **Chat API** (`POST /demo/api/chat`, the "Ask Vendor Guard" panel on `/demo`)

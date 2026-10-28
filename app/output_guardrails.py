@@ -5,8 +5,13 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 PLACEHOLDER = re.compile(r"\{\{\s*(E\d+)\.([a-z_]+)\s*\}\}")
-# buyer text never goes into a sentence; amount_check is a bare "matches"/"differs" that read as "differs the"
-NOT_FILLABLE = {"quote", "amount_check"}
+# buyer text never goes into a sentence; amount_check is a bare "matches"/"differs" that read as "differs the";
+# type and confirmed are codes ("PAYMENT_LINK", "yes") the model wrote into sentences (E07, 2026-10-25)
+NOT_FILLABLE = {"quote", "amount_check", "type", "confirmed"}
+# a label is a verb phrase for "the buyer …": anywhere else it read "which is a wants another address" (RECHECK #25).
+# After ": " and "; " for the template's list, after "and " for a second one
+MISPLACED_LABEL = re.compile(r"(?<!the buyer )(?<!and )(?<!: )(?<!; )\{\{\s*E\d+\.label\s*\}\}", re.I)
+CODE_NAME = re.compile(r"\b[A-Z]+_[A-Z_]+\b")  # a signal's type, as "The buyer claims OVERPAYMENT_REFUND"
 SOURCE_ID = re.compile(r"\bE\d+\b")
 # anything outside plain ASCII and Latin letters: superscripts, homoglyphs, soft hyphens, full-width forms
 BAD_CHAR = re.compile(r"[^\x20-\x7eÀ-ſ«»‘’“”–—…]|[<>\[\]@]")
@@ -44,10 +49,12 @@ def validate(sentences: list[Sentence], evidence: dict[str, dict], most: int = 4
         for src, field in PLACEHOLDER.findall(s.text):
             if src not in s.sources or field in NOT_FILLABLE or field not in evidence.get(src, {}):
                 errors.append(f"{i}: placeholder {src}.{field} not allowed")
+        if MISPLACED_LABEL.search(s.text):
+            errors.append(f"{i}: a label must follow 'the buyer'")
         # only real evidence ids are skipped: "E500" is a number, not a source
         rest = SOURCE_ID.sub(lambda m: "" if m[0] in evidence else m[0], PLACEHOLDER.sub("", s.text))
         for rule, pattern in (("brace", r"[{}]"), ("character", BAD_CHAR), ("digit", r"\d"),
-                              ("currency", CURRENCY), ("link", LINK), ("banned phrase", BANNED)):
+                              ("currency", CURRENCY), ("link", LINK), ("banned phrase", BANNED), ("code name", CODE_NAME)):
             if re.search(pattern, rest):
                 errors.append(f"{i}: {rule} outside placeholders")
     return errors

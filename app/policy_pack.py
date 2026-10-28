@@ -3,7 +3,9 @@
 An entry is shown, or offered to the LLM, only when verified is True: a person has read its source page (test U16).
 PayPal texts repeat their page; the only edit is "we/our" -> "PayPal", so they don't read as Vendor Guard speaking.
 """
-from app.scam_check import MONEY_OUT_WARNING, POLICY, STEPS, SUPPORT
+from app.scam_check import (
+    CONTACT_PAYPAL, MONEY_OUT, MONEY_OUT_WARNING, POLICY, SHIP, SIGNAL_STEPS, SIGNALS, STEPS, SUPPORT,
+)
 
 REGION = "us"  # the sandbox's region: Seller Protection, deadlines and help pages depend on it
 PAYPAL_PAGES = f"https://www.paypal.com/{REGION}/"
@@ -27,12 +29,24 @@ def _partial(url: str) -> str:
     return f" This is not PayPal's full list: check every requirement on PayPal's page: {url}"
 
 
+def _numbered(todo) -> str:
+    return "What to do:\n" + "\n".join(f"{n}. {s}" for n, s in enumerate(todo, 1))
+
+
 def _what_to_do(pid: str) -> dict:
     """One note per outcome, so the chat can answer "what do I do now?" with only the seller's own outcome."""
     label, shown, todo = STEPS[pid]
     title = f"WAIT, {label.lower()}: what to do" if pid.startswith("P.WAIT") else f"{label}: what to do"
-    return _vg(title, f"You saw: {POLICY[pid]}\n{shown}\nWhat to do:\n"
-               + "\n".join(f"{n}. {s}" for n, s in enumerate(todo, 1)) + f"\n{SUPPORT}", "graph-1-scam_check")
+    return _vg(title, f"You saw: {POLICY[pid]}\n{shown}\n{_numbered(todo)}\n{SUPPORT}", "graph-1-scam_check")
+
+
+def _warning_sign(signal: str) -> dict:
+    """One note per warning sign, for a seller who describes it before any check: the card's step for it."""
+    if signal == "UPFRONT_FEE":  # its step, "Don't pay any fee…", is half of the warning: once is enough
+        text = MONEY_OUT_WARNING
+    else:
+        text = SIGNAL_STEPS[signal] + (f" {MONEY_OUT_WARNING}" if signal in MONEY_OUT else "")
+    return _vg(f"Warning sign: the buyer {SIGNALS[signal]}", f"{text}\n{SUPPORT}", "graph-1-scam_check")
 
 
 POLICY_PACK = {
@@ -53,6 +67,12 @@ POLICY_PACK = {
         "graph-1-scam_check",
     ),
     **{f"vg_{pid[2:].lower()}": _what_to_do(pid) for pid in STEPS},
+    **{f"vg_signal_{signal.lower()}": _warning_sign(signal) for signal in SIGNALS},
+    "vg_already_shipped": _vg(
+        "Already shipped, and the payment isn't in PayPal",
+        _numbered([STEPS["P.SCAM_LIKELY"][2][2], f"If it isn't there, contact PayPal now: {CONTACT_PAYPAL}", SHIP[3]]),
+        "graph-1-scam_check",
+    ),
     "vg_how_to_check": _vg(
         "How to check a payment",
         "Say check. I'll ask for your price, for example 25.00 USD, and then for the buyer's chat: paste it exactly "

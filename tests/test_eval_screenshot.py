@@ -15,7 +15,7 @@ from app import db, llm, scam_check
 from tests.test_eval_output_guardrails import KEY, real_llm  # noqa: F401  (real_llm is an autouse fixture)
 from tests.test_scam_check import TID, capture, search
 
-pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason="needs GROQ_API_KEY in .env")]
+pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason="needs GROQ_API_KEY_LLM_EVAL in .env")]
 
 
 def screenshot(*messages, blur=0) -> bytes:

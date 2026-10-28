@@ -2,7 +2,9 @@
 
     pytest -m eval -v
 
-The key comes from GROQ_API_KEY in .env (conftest swaps the environment's key for a canary).
+The evals have their own Groq keys in .env, never the app's GROQ_API_KEY: GROQ_API_KEY_LLM_EVAL for the app's calls,
+GROQ_API_KEY_LLM_JUDGE for E07's judge (conftest swaps the environment's key for a canary). With LANGSMITH_TRACING=true
+in .env, each eval is traced to LangSmith's project vendorguard-evals, never the dev one, to follow a run as it goes.
 Made-up chats only: everything here is sent to Groq. The other eval files import the key and fixtures from here.
 """
 import json
@@ -14,18 +16,33 @@ import groq
 import httpx
 import pytest
 from dotenv import dotenv_values
+from langchain_core.tracers.langchain import wait_for_all_tracers
+from langsmith import utils as langsmith_utils
 
 from app import db, llm, scam_check
 from tests.test_scam_check import TID, capture, search
 
-KEY = (dotenv_values(Path(__file__).parent.parent / ".env").get("GROQ_API_KEY") or "").strip()
-pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason="needs GROQ_API_KEY in .env")]
+ENV = dotenv_values(Path(__file__).parent.parent / ".env")
+KEY = (ENV.get("GROQ_API_KEY_LLM_EVAL") or "").strip()
+# only the evals trace, never the offline tests: their own project, the endpoint and key from .env
+TRACING = {k: v for k, v in ENV.items() if k.startswith("LANGSMITH_") and v} | {"LANGSMITH_PROJECT": "vendorguard-evals"}
+pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason="needs GROQ_API_KEY_LLM_EVAL in .env")]
 
 
 @pytest.fixture(autouse=True)
 def real_llm(monkeypatch):
     # the app client has max_retries=0; here the SDK may wait out the free tier's per-minute limit
     monkeypatch.setattr(llm, "client", groq.Groq(api_key=KEY, timeout=60, max_retries=6))
+    if TRACING.get("LANGSMITH_TRACING") != "true":
+        yield
+        return
+    for name, value in TRACING.items():
+        monkeypatch.setenv(name, value)
+    langsmith_utils.get_env_var.cache_clear()  # langsmith caches what it read, tracing off included
+    yield
+    wait_for_all_tracers()  # sent before the next test, so the run shows up in LangSmith as it goes
+    monkeypatch.undo()
+    langsmith_utils.get_env_var.cache_clear()
 
 
 @pytest.fixture

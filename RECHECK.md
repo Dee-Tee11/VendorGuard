@@ -37,17 +37,11 @@ Points marked with \* are important: do them first.
   Added 2026-10-24 with the live demo. `client_ip()` takes the last entry, assuming Render's proxy appends the caller's address after anything the caller sent. Not checked on Render. If Render puts another proxy in front, the last entry could be that proxy, and every tester would share one limit. If it doesn't append at all, a caller could forge its address.
   *Fix:* on the first deploy, send `curl -H "X-Forwarded-For: 1.2.3.4" https://<app>/demo/api/session` a few times and log what `client_ip()` sees. Then fix the rule in `client_ip()` only.
 
-- [ ] **24. Ending a demo session during a check can leave rows behind.** [app/db.py](app/db.py)
-  Added 2026-10-24. If "End demo" runs while a check of the same session is running, the session's `demo_cases` row is deleted first, and the check then saves its `scam_cases` and `claimed_payments` rows, which nothing deletes. They hold no chat and no quotes.
-  *Fix:* if it matters, sweep `scam_cases` and `claimed_payments` rows whose case has no session, or let `/demo/api/end` wait for the session's running check.
-  *2026-10-25:* fixed for checks run through the chat: `demo.turn` runs a chat message and "End demo" one at a time (409). Still open for step 3: `/demo/api/check` takes `demo.session`, not `demo.turn`, so "End demo" can run while that check is running.
-
 ## LLM output
 
-- [ ] **25. The explanation reads badly around signal labels.** [app/scam_check.py](app/scam_check.py)
-  Added 2026-10-24, from a live run of the demo's fake-email chat. The labels are verb phrases written for "the buyer …" ("offers an email or screenshot as proof…"), and the model put them where a noun goes: "The buyer provides FAKE_PAYMENT_PROOF which is a offers an email…", "The communication includes a says the money is released only after…". The guardrails pass it (it is grounded), so the seller sees it.
-  Eval runs on 2026-10-25 show it in most explanations: "The buyer mentions says they paid too much…", "which is a warning sign rushes or threatens you", "The buyer claims OVERPAYMENT_REFUND and…", "The buyer PAYMENT_LINK sends a link… yes." (the model filled `{{E2.type}}` and `{{E2.confirmed}}`). The template's "Warning signs in the chat: a; b." reads better than most of them.
-  *Fix:* a graph change, so plan it first. Either tell `EXPLAIN_PROMPT` that `{{Ek.label}}` follows "the buyer", give each signal a noun-phrase label for the LLM, or drop the model from the explanation and always use the template. Then score the E07 replies with an LLM-as-judge (does each sentence read well and match the evidence?): its KPIs only check the rules in `output_guardrails`, not the wording.
+- [ ] **25. Nobody scores how the explanation reads.** [app/scam_check.py](app/scam_check.py)
+  Added 2026-10-24. The sentences that read badly ("The buyer mentions says…", "which is a wants another address…", `{{E2.type}}` filled in) are now rejected in code and replaced by the template (see CHANGES.md, 2026-10-27). What passes can still be correct but unclear.
+  *To do:* score the E07 cards' sentences with an LLM-as-judge (does each sentence read well and match the evidence?), and count how often the template replaces the model. If it is most of the time, drop the model from the explanation.
 
 - [ ] **16. Nobody measures whether `detect_signals` catches real scams.** [app/scam_check.py:183](app/scam_check.py#L183)
   Added 2026-10-21, from a design discussion, not the review. No eval scores `detect_signals` on its own. The signals never decide `VERIFIED` (PayPal does), but they decide `SCAM_LIKELY` and the warnings, and their recall and false-alarm rate are unknown.
@@ -64,6 +58,7 @@ Points marked with \* are important: do them first.
   Added 2026-10-22 with the `chat` graph, not from the review. In the Chat tab every message enters `messages` before any node runs, so the checkpointer stores the buyer's chat (in `langgraph dev`: `.langgraph_api/`). `/scam-check` never stores it. The chat's LLM never reads it again, but it is personal data at rest. `RemoveMessage` only clears the latest state, and deleting a thread in `langgraph dev` leaves the message blobs on disk.
   *Fix:* before the chat gets an API endpoint, take the buyer's chat in a field that is not a message, or run the check on a thread with no checkpointer.
   *2026-10-25:* the chat now has a demo endpoint (`POST /demo/api/chat`). There the thread is in memory and deleted when the demo session ends or the service restarts, so nothing reaches disk. Still open for any endpoint outside the demo.
+  *2026-10-27:* the thread also keeps `last_question`, the seller's last message that `classify` read (never the buyer's chat, which never reaches `classify`), and `last_case`, codes only.
 
 - [ ] **20. Names can reach Tavily.** [app/chat.py](app/chat.py)
   Added 2026-10-22. The search query drops self-introductions ("I'm Amanda"), emails, links, phone numbers and IDs, but not other names ("my buyer John wants F&F"). Tavily's terms give it a perpetual licence over queries.
@@ -72,11 +67,11 @@ Points marked with \* are important: do them first.
 - [ ] **21. The PayPal notes cover only part of PayPal's rules.** [app/policy_pack.py](app/policy_pack.py)
   Added 2026-10-22, when the 17 PayPal notes were verified. A question outside them gets Tavily links only, and `dispute_defense` (1–7 Nov) will need more than they give.
   *To find and verify, each from a `https://www.paypal.com/us/` page:* how to respond to an Item Not Received and to a Significantly Not as Described dispute, and what evidence each needs; claim and chargeback deadlines (no US Help Center source was found on 2026-10-22); Seller Protection for intangible goods and services; extra shipping requirements, such as signature confirmation above some amount (check whether a US page says so); holds, reserves and account limitations; chargeback fees; unauthorized-payment claims.
+  *2026-10-27, from E07 case 2:* "Should I ship while the money is on hold?" No note answers it. PayPal's hold page implies yes (add tracking, the hold is released after delivery), but a note must say it in PayPal's words.
   *Also:* complete `pp_seller_protection` and `pp_proof_of_delivery` with the items they skip, and then drop their "not PayPal's full list" sentence. Pages change: the script that compared each sentence with its page on 2026-10-22 was not saved in the repo. Make it an opt-in eval (`pytest -m eval`) and rerun it before the demo.
 
-- [ ] **22. Vendor Guard's own notes cite the README.** [app/policy_pack.py:17](app/policy_pack.py#L17)
-  Added 2026-10-24, from the E06 eval. The `vg_*` notes end with "Source: README.md#graph-1-scam_check", which a seller can't open. A PayPal link would be a false source: these notes describe Vendor Guard's rules, not PayPal's.
-  *Fix:* with the frontend, a page for the policy pack, such as `GET /help`, built from the same entries with one anchor per note, and `source_url="/help#<key>"`. Update the `README.md#` check in `tests/test_chat.py`. Also move the "different transaction IDs" sentence out of `vg_why_wait`, so `pp_different_ids` answers it with PayPal's link.
+- [ ] **22. `vg_why_wait` explains different transaction IDs in Vendor Guard's words.** [app/policy_pack.py](app/policy_pack.py)
+  Added 2026-10-24, from the E06 eval. *Fix:* move the "different transaction IDs" sentence out of `vg_why_wait`, so `pp_different_ids` answers it with PayPal's link.
 
 - [ ] **26. A screenshot sent with "can you verify this?" is dropped, and the seller has to send it again.** [app/chat.py](app/chat.py) (`start_check`)
   Added 2026-10-25, from a live test on `/demo`. The seller attached `receipt-….png` with "Hi can you verify this ?" before saying `check`. `route_in` sent it to `start_check`, which works as designed: the image isn't read and the reply asks for the price, then says "paste the chat again". To the seller it looks as if Vendor Guard ignored the screenshot. The reply also talks about "the chat" and "a question" when they sent an image and a request.
@@ -93,10 +88,9 @@ Points marked with \* are important: do them first.
   - EN and PT.
   Draw the screenshots with Pillow, as `tests/test_eval_screenshot.py` does, or use the demo's "Buyer's receipt" and "Seller's receipt". Run it like the E06 eval, and fix #26 against it.
 
-- [ ] \* **28. "What does WAIT mean?" gives a generic list, not the reason for the seller's own check.** [app/policy_pack.py:39](app/policy_pack.py#L39)
-  Added 2026-10-25, from a live test on `/demo`: a payment that was `COMPLETED` but for a different amount than the price got WAIT, and the seller asked the chat why. The reply is the `vg_why_wait` note: every `P.WAIT_*` instruction joined into one paragraph. Some of them mean nothing on their own ("Don't ship yet." is the PENDING reason, but it never says "pending"). The chat also can't know the seller's case. The demo's check panel runs `scam_check` outside the chat graph, and a check run in the chat leaves no case in the chat state.
-  Step 1 is done (see CHANGES.md): one note per reason, with next steps. The chat finds the right one only if the seller names the reason or pastes the WAIT card's sentence.
-  *Fix still to do:* make the chat answer about the seller's last case: "WAIT because PayPal shows X USD and you asked for Y USD." This needs the case in the chat state (for example `case_id`, written by `check` and by the demo's check panel), read from the stored case's evidence. It is a graph change, so plan it first.
+- [ ] **28. "What does WAIT mean?" doesn't say the amounts of the seller's own check.** [app/chat.py](app/chat.py)
+  Added 2026-10-25, from a live test on `/demo`. Steps 1 and 2 are done (see CHANGES.md): one note per outcome, and the chat keeps the last check's outcome (`last_case`, codes only) from a chat check or the demo's panel, so "what do I do now?" gets that outcome's note.
+  *Still to do:* "WAIT because PayPal shows X USD and you asked Y USD." That needs the amounts in `last_case`, read from the stored case's evidence (E1 is PayPal's and the seller's data, not the buyer's). A graph change, so plan it first.
 
 - [ ] **29. No dataset to see the outcome and the next steps the chat gives.** [app/scam_check.py:59](app/scam_check.py#L59)
   Added 2026-10-25, after `STEPS` and `SIGNAL_STEPS`. U16 and S02 check that every policy id and signal has its steps, not that a real case gets the right ones. #27 scores the chat's flow and #16 the signals; this one scores what the seller is told to do at the end.
@@ -106,3 +100,7 @@ Points marked with \* are important: do them first.
   - after the check, the seller asks "what do I do now?", "can I ship?", "o que faço agora?" or pastes the card's sentence: the reply should give the same steps as the card, through the matching `vg_*` note;
   - EN and PT.
   Save each run's verdict, steps, support line and chat reply to `tests/eval_results/`, so the outcomes can be read side by side. Read the first run by hand before scoring anything: are the steps right for the case, in a sensible order, and not too many?
+
+- [ ] **30. The chat's last check can be stale.** [app/chat.py](app/chat.py)
+  Added 2026-10-27, with the chat's context (RISKS.md). After a VERIFIED check, "can I ship?" about another order could get the VERIFIED note. Mitigated: `classify` is told a check covers only its own payment, a new check or cancel forgets it, and the reply names the case. Not measured beyond E07 case 37.
+  *Fix if it shows up:* forget `last_case` after a few turns, or answer a ship question after a VERIFIED case only with "check that payment first".

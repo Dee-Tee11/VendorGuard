@@ -1,0 +1,35 @@
+{"id": 1, "score": 2, "note": "should have told the seller to ask for PayPal goods and services"}
+{"id": 2, "score": 2, "note": "right info, but no context: the same answer twice"}
+{"id": 3, "score": 5, "note": "routing to the check to find the payment is right"}
+{"id": 4, "score": 5, "note": ""}
+{"id": 5, "score": 5, "note": ""}
+{"id": 6, "score": 4, "note": "the context is a bit complex"}
+{"id": 7, "score": 4, "note": "correct, but the same answer twice"}
+{"id": 8, "score": 5, "note": "good use of Vendor Guard: starts the check"}
+{"id": 9, "score": 5, "note": "the source is a README.md, not very good"}
+{"id": 10, "score": 5, "note": ""}
+{"id": 11, "score": 5, "note": ""}
+{"id": 12, "score": 4, "note": "no next steps, but the message was safe"}
+{"id": 13, "score": 4, "note": "should ask whether the seller wants Vendor Guard to check"}
+{"id": 14, "score": 1, "note": "out of context, as if it didn't read the message"}
+{"id": 15, "score": 1, "note": "out of context: the seller asked what to do and got no proper answer"}
+{"id": 16, "score": 1, "note": "agrees with the judge"}
+{"id": 17, "score": 5, "note": ""}
+{"id": 18, "score": 3, "note": "tried to help with the check, but stuck in the check when the seller asked who can help"}
+{"id": 19, "score": 5, "note": ""}
+{"id": 20, "score": null, "note": "the test itself is confusing"}
+{"id": 21, "score": 5, "note": "a tool that tells the seller when the payment completes? too powerful for an agent? human in the loop?"}
+{"id": 22, "score": 1, "note": "the seller asks what to do now and the reply is very poor"}
+{"id": 23, "score": 1, "note": "should answer from the PayPal side: only a payment in PayPal counts, not a screenshot"}
+{"id": 24, "score": 3, "note": "should talk about the evidence: a possible scammer, or still waiting on the payment"}
+{"id": 25, "score": 5, "note": ""}
+{"id": 26, "score": 3, "note": "no good advice on what to ask the buyer, though the card above says it: no context of the conversation"}
+{"id": 27, "score": 5, "note": ""}
+{"id": 28, "score": 5, "note": ""}
+{"id": 29, "score": 5, "note": ""}
+{"id": 30, "score": 3, "note": "not a good test: that part doesn't exist yet"}
+{"id": 31, "score": 4, "note": ""}
+{"id": 32, "score": 4, "note": "good, could be better"}
+{"id": 33, "score": 5, "note": ""}
+{"id": 34, "score": 5, "note": ""}
+{"id": 35, "score": 4, "note": ""}

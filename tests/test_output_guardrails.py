@@ -18,6 +18,7 @@ def s(text, sources=("E1",), intent="EXPLAIN_PAYMENT"):
     s("PayPal shows this payment as {{E1.paypal_status}} for {{E1.amount}} {{E1.currency}}."),
     s("PayPal reports {{ E1.status }}, e.g. the payment exists."),
     s("The chat shows a warning sign: {{E2.label}}.", ["E2"], "EXPLAIN_SIGNAL"),
+    s("The buyer {{E2.label}}.", ["E2"], "EXPLAIN_SIGNAL"),
     s("Only E1 could be checked, so the relationship to this buyer is unclear.", intent="ADMIT_MISSING"),
 ])
 def test_grounded_sentences_pass(sentence):
@@ -32,6 +33,11 @@ def test_grounded_sentences_pass(sentence):
     pytest.param(s("The buyer wrote {{E2.quote}}.", ["E2"]), "placeholder", id="U18 quote is never fillable"),
     pytest.param(s("The amount {{E1.amount_check}} the price."), "placeholder", id="U18 amount_check is never fillable"),
     pytest.param(s("PayPal shows {E1.status}."), "brace", id="U18 stray brace"),
+    pytest.param(s("The buyer said {{E2.type}}.", ["E2"]), "placeholder", id="U18 type is never fillable"),
+    pytest.param(s("The buyer {{E2.label}}: {{E2.confirmed}}.", ["E2"]), "placeholder", id="U18 confirmed is never fillable"),
+    pytest.param(s("The buyer mentions {{E2.label}}.", ["E2"]), "label", id="#25 a label after a verb"),
+    pytest.param(s("It is a {{E2.label}}.", ["E2"]), "label", id="#25 a label where a noun goes"),
+    pytest.param(s("The buyer claims OVERPAYMENT_REFUND here.", ["E2"]), "code name", id="#25 a signal's type"),
     pytest.param(s("The buyer paid 25 already."), "digit", id="U19 digit"),
     pytest.param(s("The buyer paid E500 extra."), "digit", id="U19 number shaped like an evidence id"),
     pytest.param(s("The buyer says fifty euros arrived."), "currency", id="U19 currency word"),

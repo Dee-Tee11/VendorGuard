@@ -1,0 +1,34 @@
+# Risks
+
+Risk and security review of the changes planned on 2026-10-27, after the E07 eval (`tests/eval_baselines/seller-20261025T193317Z.txt`) and the user's scores of it. For the user to analyse. Open points still go to `RECHECK.md`.
+
+## Invariants no change may break
+
+1. The buyer's chat never reaches the chat's LLM (`classify`) or Tavily while `awaiting="chat"` (test_c05, extended).
+2. Every word the seller reads is written by code, by a verified note quoted word for word, or by PayPal. The LLM only picks closed choices.
+3. Only `verdict_for` decides the verdict. Context never gives VERIFIED to a new payment.
+4. The new state fields can't be written through the input (`input_schema=MessagesState`). The `START` router doesn't read them, since it sees the raw input.
+5. A node writes only what its `@owns` lists.
+6. Tavily gets only the current message, cleaned by `_query()`, never the context.
+
+## Changes and their risks
+
+| Change | Risk | Severity | Mitigation | Residual risk |
+|---|---|---|---|---|
+| Context in classify (`last_question`) | Injection through the previous question | Low: the seller writes both, and the output is closed choices | `sanitize` and a `<previous>` tag marked as data; a test with an injection in the previous turn | Worst case, a wrong note |
+| `last_question` stored | Personal data at rest in the checkpointer (#19) | Low: the text is already in `messages` | Only text that went through classify is stored, never the buyer's chat; in the demo it goes with the session | Added to #19 |
+| `last_case` | Stale context: "can I ship?" about another order shows the VERIFIED note of an earlier check | **Medium** | Stores only `policy_id`, signal types and `case_id`: no quotes, no amounts. `start_check` and `cancel` clear it. The reply starts "About your last check (case abcd1234):". Since the E07 run of 2026-10-27: an outcome note is shown only when it is the last check's own (in code), and another order gets the `another_payment` reply | The LLM can still miss "another order" and show the last check's note, headed with its case; E07's no-verdict rule watches it |
+| The demo's check panel writes `last_case` | A race with a chat message (`update_state` in parallel) | Medium | The `_busy` slot is taken **inside** the `_stream_check` generator: a `Depends(scope="function")` would release it before the stream ends | The chat answers 409 during a check (~10 s) |
+| Leaving the price step for classify | A short buyer chat, with no id and no `Buyer:`, pasted at this step reaches classify's LLM | Low to medium: the first message already allows it today | `_looks_like_chat` still filters; the output is closed choices; worst case the check is cancelled. `awaiting="chat"` is **never** left this way | Same as the first message today |
+| `vg_signal_*` and "already shipped" notes | Wrong advice that looks official; the source is the README (#22) | Low | Built from `SIGNAL_STEPS`, `STEPS` and `SUPPORT`, already shown on the cards; new wording approved by the user | #22 stays open |
+| More notes in the prompt | classify picks worse | Medium | Rerun E06 and E07 | Measured |
+| Quoting sentences of a note just shown (removed 2026-10-27, back the same day at the reviewer's request) | A sentence out of context inverts the meaning | **Medium**, and it happened in the first version | The first version listed every note's sentences, put sentence ids where note keys go, and quoted under "PayPal says:": "Can I ship that one too?" got "You must ship the item…" (cases 36, 37, unsafe) and Groq returned 400 nine times. Now: only the notes of the last reply are listed, numbered, in their own `sentences` field (`list[int]`); the title stays above the quote; after a check or a new check `shown` is empty, so there is nothing to quote | A quoted sentence can still read as permission; E07's judge and the no-verdict rule watch it |
+| A bigger prompt (the sentences) | More tokens and Groq rate limits | Medium, and it happened: 255K tokens in one E07 run, over the free tier's 200K a day | Only the last reply's notes (at most 2) are listed, and only on a follow-up; the evals have their own Groq keys | Watch the tokens in E07 |
+| #25 fixed in the prompt | The LLM still writes awkward sentences that pass the guardrails | Medium | Two rules **in code** in `output_guardrails`: `type` and `confirmed` can't be filled, and `{{Ek.label}}` counts only right after "the buyer". Otherwise the template | Correct but unclear sentences; E05 measures them |
+| Dropping notes already shown (`shown`) | The seller wants the same note again | Low | Shows the title and "in my last answer" | — |
+| Deduplicating card steps | Losing a needed step | Low | `scam_check.COVERED` drops a warning sign's step only where the outcome's own steps say it: `OVERPAYMENT_REFUND` on a wrong amount; `THIRD_PARTY_SHIPPING` on VERIFIED_WITH_WARNINGS (the ship steps name the address and the label); overpayment, fee, link and fake proof on SCAM_LIKELY (its steps say don't send money, pay a fee or open links, and that only the Activity counts). With a test | The card's signal-specific wording ("log in to PayPal yourself") is gone in those cases |
+| Eval changes | None for security | — | Only made-up data goes to Groq and LangSmith (EU) | — |
+
+No new LLM cost per message: classify is still one call. The exception is the price step with text that isn't a price, which made no call before and now makes one. The demo's "message" rate limit already counts it.
+
+**Out of scope:** a tool that tells the seller when a payment turns Completed (the user's question on E07 case 21). It needs RECHECK #2 (re-fetch the payment from PayPal before acting on a webhook event). It needs no human in the loop, since it only reads.
