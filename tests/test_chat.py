@@ -11,7 +11,7 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ValidationError
 
-from app import chat, llm, policy_pack, scam_check
+from app import chat, llm, output_guardrails, policy_pack, scam_check
 from tests.test_scam_check import (  # noqa: F401  (claimed is an autouse fixture, llm_stub a fixture)
     GROQ, PAID, PNG, SCAM_CHAT, TID, TWO_SIGNALS, capture, claimed, completion, llm_stub, search,
 )
@@ -24,12 +24,18 @@ FAKE_RESULT = {"case_id": "c1", "verdict": "WAIT", "policy_id": "P.WAIT_NOT_CONF
 
 @pytest.fixture
 def choice(llm_stub, monkeypatch):
-    """The classify answer (`intent` may be an exception) and every Groq prompt; scam_check's calls go to llm_stub."""
-    stub = SimpleNamespace(intent="other", entries=[], sentences=[], calls=[], prompts=[])
+    """The classify answer (`intent` may be an exception), the follow-up's `answer` ([(text, sources)] or an exception;
+    none by default, so the notes are quoted) and every Groq prompt; scam_check's calls go to llm_stub."""
+    stub = SimpleNamespace(intent="other", entries=[], sentences=[], calls=[], prompts=[], answer=[], answers=[])
     scam_check_ask = llm.ask
 
     def ask(schema, system, user, attempts=2):
         stub.prompts.append((schema.__name__, system + user))
+        if schema is output_guardrails.Answer:
+            stub.answers.append(SimpleNamespace(system=system, user=user, attempts=attempts))
+            if isinstance(stub.answer, Exception):
+                raise stub.answer
+            return schema(sentences=[output_guardrails.Cited(text=t, sources=n) for t, n in stub.answer])
         if schema is not chat.Choice:
             return scam_check_ask(schema, system, user)
         stub.calls.append(SimpleNamespace(system=system, user=user, attempts=attempts))
@@ -648,7 +654,7 @@ def test_c23_an_instruction_to_vendor_guard_is_never_classified(choice, talk, te
     talk.graph.update_state(talk.config, {"last_case": VERIFIED_CASE}, as_node="check")
     choice.intent, choice.entries = "question", ["vg_verified"]
     reply = talk(text)
-    assert choice.calls == [] and talk.state["intent"] == "other" and talk.state["last_question"] is None
+    assert choice.prompts == [] and talk.state["intent"] == "other" and talk.state["last_question"] is None
     assert "You can ship" not in reply and chat.INTRO in reply
 
 
@@ -663,3 +669,80 @@ def test_c24_another_payment_without_a_check_is_how_to_check(choice, talk):
     choice.intent = "another_payment"
     reply = talk("Another buyer paid. Can I ship?")
     assert talk.state["intent"] == "question" and chat.VERIFIED["vg_how_to_check"]["text"] in reply
+
+
+FF = chat.VERIFIED["pp_friends_and_family"]
+GOOD = [("Ask the buyer to choose “Paying for an item or service”, which is for buying goods or services.", [2]),
+        ("Personal payments aren't covered by PayPal Purchase Protection.", [3])]
+
+
+def ff_follow_up(choice, talk, answer):
+    """Friends and Family shown in full, then a follow-up that classify answers with its sentence 2."""
+    choice.intent, choice.entries = "question", ["pp_friends_and_family", "pp_seller_protection"]
+    talk("A buyer wants to pay me with Friends and Family. Is that OK?")
+    choice.answer, choice.entries, choice.sentences = answer, [], [2]
+    return talk("So what should I ask them to do instead?")
+
+
+def test_c25_a_follow_up_is_answered_in_sentences_that_cite_the_notes(choice, talk):
+    reply = ff_follow_up(choice, talk, GOOD)
+    assert reply == (f"{GOOD[0][0]} {GOOD[1][0]}\n\nFrom my notes: {FF['title']}\nSource: {FF['source_url']}")
+    assert talk.state["shown"] == ["pp_friends_and_family"]
+    call, = choice.answers
+    assert call.attempts == 1 and call.system == chat.ANSWER_PROMPT
+    assert call.user == ("<notes>\nFriends and Family or goods and services:\n"
+                         + "\n".join(f"[{n}] {s}" for n, (_, s) in enumerate(chat._listed(["pp_friends_and_family"]), 1))
+                         + "\n</notes>\n<question>\nSo what should I ask them to do instead?\n</question>")
+
+
+def test_c25_a_note_not_shown_yet_is_shown_in_full_not_answered(choice, talk):  # review 2026-10-29 #3
+    choice.intent, choice.entries = "question", ["pp_friends_and_family"]
+    talk("A buyer wants to pay me with Friends and Family. Is that OK?")
+    choice.answer, choice.entries, choice.sentences = GOOD, ["pp_chargeback"], []
+    reply = talk("And what is a chargeback?")
+    assert not choice.answers and chat.VERIFIED["pp_chargeback"]["text"] in reply
+
+
+def invalid():
+    try:
+        output_guardrails.Answer.model_validate({"sentences": "x"})
+    except ValidationError as e:
+        return e
+
+
+@pytest.mark.parametrize("answer", [
+    pytest.param(RuntimeError("groq down"), id="llm error"),
+    pytest.param(invalid(), id="schema error"),
+    pytest.param([], id="no sentences"),
+    pytest.param([GOOD[0], ("PayPal covers it within 12 days.", [4])], id="one bad sentence"),
+    pytest.param([("Friends and Family payments are covered.", [3, 4])], id="injected flip"),
+    pytest.param([("You can ship it today.", [2])], id="ship without a check"),
+])
+def test_c25_any_failure_quotes_the_notes_as_before(choice, talk, answer):
+    sentence = chat._listed(["pp_friends_and_family"])[1][1]
+    assert ff_follow_up(choice, talk, answer) == f"{FF['title']}\n{sentence}\nSource: {FF['source_url']}"
+    assert len(choice.answers) == 1
+
+
+def test_c25_no_answer_step_on_a_first_question_or_right_after_a_check(choice, talk, ran):
+    choice.intent, choice.entries, choice.answer = "question", ["pp_friends_and_family"], GOOD
+    talk("Is Friends and Family OK?")
+    talk("check")
+    talk("25.00 USD")
+    talk(PAID)
+    talk("Is Friends and Family OK?")
+    assert choice.answers == []
+    choice.entries, choice.sentences = [], [2]
+    talk("So what should I ask them to do instead?")  # a follow-up after the check: its prompt has no buyer chat
+    assert len(choice.answers) == 1 and "QUOTE-CANARY" not in choice.answers[0].user and PAID not in choice.answers[0].user
+
+
+def test_c25_ship_only_from_the_last_checks_own_note(choice, talk):
+    talk.graph.update_state(talk.config, {"last_case": VERIFIED_CASE}, as_node="check")
+    choice.intent, choice.entries = "question", ["vg_verified"]
+    talk("What do I do now?")
+    choice.answer, choice.entries, choice.sentences = [("You can ship, only to the address on this payment's "
+                                                         "Transaction Details page in PayPal.", [1, 2])], [], [1, 2]
+    reply = talk("So I can ship?")
+    assert reply.startswith("About your last check (case cccccccc):\n\nYou can ship, only to the address")
+    assert f"From my notes: {chat.VERIFIED['vg_verified']['title']}" in reply and reply.endswith(scam_check.SUPPORT)
