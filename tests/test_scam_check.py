@@ -538,6 +538,35 @@ def test_api_checks_the_size_before_decoding(monkeypatch):
     assert client.post("/scam-check", json=BODY | {"image": "A" * 4_000_004}).status_code == 422
 
 
+def test_s12_a_body_over_the_cap_is_413_before_it_is_read(monkeypatch):
+    monkeypatch.setattr(scam_check, "run", lambda *args: pytest.fail("ran a check on an oversized body"))
+    r = client.post("/scam-check", content=b"x" * (main.MAX_BODY + 1), headers={"Content-Type": "application/json"})
+    assert r.status_code == 413
+    assert client.post("/webhooks/paypal", content=b"x" * (main.MAX_BODY + 1)).status_code == 413  # every route
+
+
+def test_s12_a_chunked_body_over_the_cap_is_413(monkeypatch):
+    monkeypatch.setattr(scam_check, "run", lambda *args: pytest.fail("ran a check on an oversized body"))
+
+    async def chunks():  # no Content-Length: the cap counts the bytes as they are read
+        for _ in range(main.MAX_BODY // 100_000 + 1):
+            yield b"x" * 100_000
+
+    async def post():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://t") as c:
+            return await c.post("/scam-check", content=chunks(), headers={"Content-Type": "application/json"})
+
+    assert asyncio.run(post()).status_code == 413
+
+
+def test_s12_the_biggest_valid_request_fits_under_the_cap(monkeypatch):
+    monkeypatch.setattr(scam_check, "run", lambda *args: {"verdict": "WAIT"})
+    image = b64(PNG + bytes(3_000_000 - len(PNG)))  # 4 000 000 chars: Screenshot's own cap
+    body = json.dumps(BODY | {"text": "😀" * scam_check.MAX_CHARS, "image": image}).encode()  # 12 bytes per emoji
+    assert len(body) <= main.MAX_BODY
+    assert client.post("/scam-check", content=body, headers={"Content-Type": "application/json"}).status_code == 200
+
+
 @pytest.mark.parametrize("transcript, detail", [
     pytest.param(RuntimeError("groq down"), "could not read the screenshot, try again or paste the chat as text",
                  id="vision call failed"),

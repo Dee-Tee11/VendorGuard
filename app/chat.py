@@ -27,8 +27,11 @@ TAVILY_URL = "https://api.tavily.com/search"
 # optional: without a key, a question with no note gets "I don't have that information" and PayPal's help link
 TAVILY_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 MAX_QUESTION = 400  # longer messages are treated as a pasted chat; also an old hard limit of Tavily's query
-INTENTS = ("question", "scam_check", "dispute", "not_paypal", "another_payment", "other")
+INTENTS = ("question", "scam_check", "dispute", "not_paypal", "another_payment", "can_ship", "next_steps", "other")
 DISPUTE_KEYS = ("pp_dispute_vs_claim", "pp_dispute_deadline", "pp_chargeback", "pp_snad_not_covered", "pp_proof_of_delivery")
+# advise's "what now?" after a dispute note: how to respond, and by when
+DISPUTE_NOTES = {*DISPUTE_KEYS, "pp_respond_to_dispute", "pp_unauthorized_claim", "pp_proof_of_shipment"}
+RESPOND_KEYS = ("pp_respond_to_dispute", "pp_dispute_deadline")
 
 VERIFIED = policy_pack.verified()
 # "You saw: …" notes: shown only for the seller's own last check, enforced in classify, not only asked in the prompt
@@ -55,7 +58,16 @@ CLASSIFY_PROMPT = (
     "transfer, another payment app, another marketplace's case. A PayPal payment whose buyer asks for money back "
     "another way is still about PayPal.\n"
     "- another_payment: <previous> names the seller's last check, and the seller now asks about a different order, "
-    "buyer, item or payment than that check's.\n"
+    "buyer, item or payment than that check's. An order at a price other than that check's price is a different "
+    "order.\n"
+    "- can_ship: the seller asks whether they can or should ship, send or hand over the item now, for example 'can I "
+    "ship?', 'is it safe to send it?', 'so I can ship it today, right?', 'posso enviar?'. Asking how, where or with "
+    "which carrier to ship is question. About a different order, buyer, item or payment than the last check's, the "
+    "intent is another_payment.\n"
+    "- next_steps: the seller asks what to do now, about the situation in <previous> or with none, without describing "
+    "a new situation or asking a concrete question, for example 'what now?', 'what do I do about the order?', "
+    "'anything else?', 'o que faço?', 'e agora?'. A seller who describes what a buyer asks or did, or asks about a "
+    "case, such as 'what should I do if a buyer asks for Friends and Family?', asks a question.\n"
     "- other: greetings, introductions, thanks, small talk, anything not about PayPal or Vendor Guard, requests about "
     "your own instructions or prompt, or a seller who says they have questions or need help "
     "(even about a possible scam) without asking a concrete one yet.\n"
@@ -104,6 +116,10 @@ PASTED = ("This looks like a buyer's chat, a screenshot or a payment ID, so I ha
           "I only read those inside a check. ")
 PASTE_AGAIN = (" Then paste the chat again. If it was a question, type cancel and ask it in under "
                f"{MAX_QUESTION} characters.")
+# a screenshot sent before "check" (RECHECK #26): dropped, not kept until the price comes, so it isn't stored longer
+SCREENSHOT_FIRST = ("Got your screenshot. I only read screenshots inside a check, so I haven't sent it anywhere. "
+                    "What price did you ask for? Write the amount and the currency, for example 25.00 USD. "
+                    "Then send the screenshot again. Type cancel to stop.")
 ASK_CHAT = ("Now paste the buyer's chat exactly as written, or send a screenshot of it. It goes straight to the check. "
             "Type cancel to stop.")
 BAD_PRICE = ("I need the amount and a 3-letter currency, for example 25.00 USD: more than 0, with up to 2 decimals. "
@@ -115,7 +131,14 @@ CANCELLED = "Check cancelled. Nothing was checked."
 CHECK_FAILED = "The check could not run. Say check to try again."
 CHECK_STOPPED = "I stopped the check to answer this. Say check to start it again."
 OFFER_CHECK = "Want me to check the payment in PayPal? Say check."
-ANOTHER_PAYMENT = "Your last check (case {}) covered only that payment. To check the other payment, say check."
+ANOTHER_PAYMENT = "Your last check ({}) covered only that payment. To check the other payment, say check."
+NO_CHECK_SHIP = "I can't tell whether you can ship without checking that payment."
+NOT_YET = "Not yet. Your last check ({}) said:"  # only for an outcome that can still change: WAIT_FOR
+DONT_SHIP = "No. Your last check ({}) said:"  # a final outcome: waiting won't make this payment safe
+WAIT_FOR = ("P.WAIT_NOT_CLEARED", "P.WAIT_NOT_CONFIRMED")
+SAME_STEPS = "The notes in my last reply are all I have on this."
+# a VERIFIED case answers "can I ship?" only for its own payment: said every time (E07 case 37, RECHECK #30)
+ONLY_THAT = "About your last check ({}). It covers only that payment: for another order or buyer, say check."
 DONT_KNOW = f"I don't have that information. PayPal's help for US businesses: {policy_pack.HELP_URL}"
 INTRO = ("Hi! I'm Vendor Guard, and I help PayPal sellers with three things:\n"
          "1. Questions about selling with PayPal: I answer from notes checked against PayPal's pages, "
@@ -133,6 +156,7 @@ NOT_PAYPAL = ("Vendor Guard only works with PayPal: I can check a PayPal payment
 LABEL = re.compile(r"(?im)^\s*(buyer|seller)\s*:")  # the screenshot copy's labels, or a seller who pastes them
 NUMBER = r"([0-9]{1,10}(?:[.,][0-9]{1,2})?)"  # as ScamCheckIn: at most 12 digits, 2 of them decimals
 PRICE = re.compile(rf"{NUMBER}\s*([A-Za-z]{{3}})|([A-Za-z]{{3}})\s*{NUMBER}")
+AMOUNT, CURRENCY = re.compile(r"[0-9]{1,10}(?:\.[0-9]{1,2})?"), re.compile(r"[A-Z]{3}")  # last_case's, fullmatch only
 # a self-introduction in a question ("Hi, I'm Amanda, is F&F safe?"): only a capitalised name, so "I am selling" stays
 INTRODUCTION = re.compile(r"\b(?i:i am|i['’]m|my name is|sou [ao]|sou|chamo-me|o meu nome é|meu nome é)\s+"
                           r"[A-ZÀ-Þ][\w'’-]*(?:\s+[A-ZÀ-Þ][\w'’-]*)?")
@@ -146,6 +170,17 @@ INSTRUCTION = re.compile(r"(?i)\b(?:ignore|disregard|forget)\b.{0,40}\b(?:instru
                          r"|\balways (?:pick|choose|say|answer|tell)\b|\byou are now\b|\badmin mode\b|(?m:^\s*system\s*:)"
                          r"|\btell me (?:that )?(?:it'?s|it is|this is|the (?:buyer'?s )?payment is)\b.{0,20}\bverified\b")
 SENTENCE = re.compile(r"(?<=[A-Za-z)”’\"][.!?])\s+")  # not after a digit: "1. Look…" and "25.00 USD" stay whole
+# advise's backstop, read only after classify said question and never before: "what should I do if a buyer asks for
+# F&F?" is a question. fullmatch, so any other word fails ("what now if they insist?")
+# ponytail: common EN and PT phrasings only; the can_ship and next_steps intents are the main route
+NEXT_STEPS = re.compile(r"(?i)(?:(?:so|ok|okay|and|então|e|depois)[ ,]+)*(?:what (?:now|next)|now what"
+                        r"|what (?:do|should) i do(?: now| next)?(?: about (?:it|this|that|the (?:order|payment|buyer|dispute|case)))?"
+                        r"|what are (?:my|the) next steps|anything else(?: i should do)?|e agora|e depois"
+                        r"|o que (?:é que )?(?:faço|devo fazer)(?: agora)?|que faço agora)[ ?!.]*")
+SHIP_ASK = re.compile(r"(?i)(?:(?:so|ok|okay|great|then|but|então|e)[ ,]+)*(?:(?:can|can['’]t|should|may) i (?:ship|send)"
+                      r"|i can (?:ship|send)|(?:is it )?(?:safe|ok|okay) to (?:ship|send)|(?:já )?posso (?:enviar|mandar)"
+                      r"|é seguro (?:enviar|mandar))(?: it| the item| the order| a encomenda| o artigo)?"
+                      r"(?: now| today| then| já| agora| hoje)?(?:,? right)?[ ?!.]*")
 GOODBYE = re.compile(r"(?i)\b(?:bye|goodbye|see you|thanks|thank you|obrigad[oa]|tchau|adeus)\b")
 DATA_URL = re.compile(r"data:image/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)")
 
@@ -156,10 +191,12 @@ class State(MessagesState, total=False):  # Studio's Chat tab needs a state that
     intent: str  # written by classify
     entries: list[str]  # written by classify
     sentences: list[int]  # numbers in _listed(shown), for a follow-up; written by classify
-    # context for classify's next call. Never the buyer's chat, its quotes or the amounts
+    # context for classify's next call. Never the buyer's chat or its quotes
     last_question: str | None  # the seller's last message that classify read, sanitized; written by classify
     shown: list[str]  # the notes in the last reply; written by every node that replies
-    last_case: dict | None  # {"case_id", "policy_id", "signals"}: codes only; written by check, the demo's panel too
+    # {"case_id", "policy_id", "signals", "price"?, "paid"?}: codes, and E1's two amounts as "40.00 USD", validated;
+    # written by check, the demo's panel too
+    last_case: dict | None
     greeted: bool  # the introduction was shown: once per thread; written by other
 
 
@@ -274,14 +311,39 @@ def search(question: str) -> list[tuple[str, str]]:
     return pages[:3]
 
 
+def _money(amount, currency) -> str | None:
+    """"40.00 USD", or None unless both are well formed: PayPal's amount is outside data. [0-9], not \\d: no other digits."""
+    if (isinstance(amount, str) and isinstance(currency, str) and AMOUNT.fullmatch(amount)
+            and CURRENCY.fullmatch(currency)):
+        return f"{Decimal(amount):.2f} {currency}"
+    return None
+
+
 def last_case(out: dict) -> dict:
-    """What the chat keeps of a check: codes only, never the evidence's quotes or amounts."""
-    return {"case_id": out["case_id"], "policy_id": out["policy_id"],
+    """What the chat keeps of a check: codes, and from E1 only the seller's price and PayPal's amount, never the
+    buyer's quotes (E2 on)."""
+    e1 = out["evidence"].get("E1", {})
+    case = {"case_id": out["case_id"], "policy_id": out["policy_id"],
             "signals": [e["type"] for k, e in out["evidence"].items() if k != "E1" and e.get("type") in scam_check.SIGNALS]}
+    amounts = {"price": _money(e1.get("expected_amount"), e1.get("expected_currency")),
+               "paid": _money(e1.get("amount"), e1.get("currency"))}  # paid: only when PayPal found a payment
+    return case | {k: v for k, v in amounts.items() if v}
+
+
+def _case_ref(case: dict) -> str:
+    """"case c882f1b4, your price 40.00 USD, PayPal shows 20.00 USD": the amounts are written here, never by the LLM."""
+    return ", ".join([f"case {case['case_id'][:8]}", *(f"{label} {case[k]}" for k, label in
+                                                      (("price", "your price"), ("paid", "PayPal shows")) if case.get(k))])
 
 
 def _case_note(case: dict | None) -> str | None:
     return f"vg_{case['policy_id'][2:].lower()}" if case and case.get("policy_id") in scam_check.STEPS else None
+
+
+def after_check(out: dict) -> dict:
+    """What a check leaves in the chat, from check() or the demo's panel: its codes, and no notes shown. Its note's
+    sentences in classify's context made the LLM apply them to another order (E07 cases 37, 51, 2026-10-30)."""
+    return {"last_case": last_case(out), "shown": []}
 
 
 def _previous(state) -> str:
@@ -296,6 +358,7 @@ def _previous(state) -> str:
     if key := _case_note(case := state.get("last_case")):
         signs = "; ".join(f"the buyer {scam_check.SIGNALS[t]}" for t in case["signals"])
         lines.append(f"The seller's last check: {scam_check.STEPS[case['policy_id']][0]}, note {key}"
+                     + (f", price {case['price']}" if case.get("price") else "")  # not PayPal's: the price tells orders apart
                      + (f". Warning signs: {signs}" if signs else ""))
     return f"<previous>\n{sanitize(chr(10).join(lines))}\n</previous>\n" if lines else ""
 
@@ -314,26 +377,46 @@ def classify(state):
         log.warning("classify failed: %s", type(e).__name__)
         return {"intent": "other", "entries": [], "sentences": [], "last_question": question}
     if choice.intent == "another_payment" and not state.get("last_case"):
-        return {"intent": "question", "entries": ["vg_how_to_check"], "sentences": [], "last_question": question}
-    picked = [k for k in dict.fromkeys(choice.entries) if k in VERIFIED]
-    # a verdict's note only for the seller's own last check; vg_verdicts says "You can ship", so only after a check
-    case_note = _case_note(state.get("last_case"))
-    entries = [k for k in picked if k == case_note or k not in VERDICT_NOTES and (k != "vg_verdicts" or case_note)][:2]
-    return {"intent": choice.intent, "entries": entries or (["vg_how_to_check"] if picked else []),
-            "sentences": [n for n in choice.sentences if isinstance(n, int)], "last_question": question}
+        out = {"intent": "question", "entries": ["vg_how_to_check"], "sentences": [], "last_question": question}
+    else:
+        picked = [k for k in dict.fromkeys(choice.entries) if k in VERIFIED]
+        # a verdict's note only for the seller's own last check; vg_verdicts says "You can ship", so only after a check
+        case_note = _case_note(state.get("last_case"))
+        entries = [k for k in picked if k == case_note or k not in VERDICT_NOTES and (k != "vg_verdicts" or case_note)][:2]
+        out = {"intent": choice.intent, "entries": entries or (["vg_how_to_check"] if picked else []),
+               "sentences": [n for n in choice.sentences if isinstance(n, int)], "last_question": question}
+    if out["intent"] == "question":  # the backstop, after the LLM only: written to intent, so nothing runs it again
+        out["intent"] = _backstop(state | out) or "question"
+    return out
 
 
 def after_classify(state) -> str:
-    if state.get("awaiting") and state["intent"] not in ("question", "dispute"):
+    if state.get("awaiting") and state["intent"] not in ("question", "dispute", "can_ship", "next_steps"):
         return "check"  # at the price step, anything but a question is a price it couldn't read
-    return {"question": "question", "another_payment": "question", "scam_check": "start_check", "dispute": "dispute"}.get(state["intent"], "other")
+    return {"question": "question", "another_payment": "question", "scam_check": "start_check", "dispute": "dispute",
+            "can_ship": "advise", "next_steps": "advise"}.get(state["intent"], "other")
+
+
+def _backstop(state) -> str | None:
+    """A "can I ship?" or "what now?" that classify called a question, by a short regex, after classify only:
+    "can_ship" unless the reply would come from the last check's own note; "next_steps" when the reply would only
+    repeat the last one or have no note (E08 case 4)."""
+    text, entries, shown = (state.get("last_question") or "").strip(), state.get("entries") or [], state.get("shown") or []
+    if SHIP_ASK.fullmatch(text) and _case_note(state.get("last_case")) not in [*entries, *(shown if state.get("sentences") else [])]:
+        return "can_ship"
+    if NEXT_STEPS.fullmatch(text) and not state.get("sentences") and set(entries) <= set(shown):
+        return "next_steps"
+    return None
 
 
 @owns("messages", "awaiting", "price", "shown", "last_case")
 def start_check(state):
     text = _text(state)
     pasted = text is None or _looks_like_chat(text)
-    return _say((PASTED if pasted else "") + ASK_PRICE + (PASTE_AGAIN if pasted else ""), awaiting="price", price=None,
+    # decoded only to pick the reply: a GIF or a broken image isn't "your screenshot" (C07)
+    reply = SCREENSHOT_FIRST if _screenshot(state) is not None else (
+        (PASTED if pasted else "") + ASK_PRICE + (PASTE_AGAIN if pasted else ""))
+    return _say(reply, awaiting="price", price=None,
                 shown=[], last_case=None)  # a new check: the last one no longer answers "what do I do now?"
 
 
@@ -380,7 +463,7 @@ def check(state):
     lines = [f"{out['verdict']}: {out['message']}", *(s["text"] for s in out["sentences"]), "What to do:",
              *(f"{n}. {s}" for n, s in enumerate(out["steps"], 1)), out["support"], f"Case {out['case_id']}"]
     # never the evidence in the reply or the state: it holds the buyer's quotes
-    return _say("\n".join(lines), awaiting=None, price=None, shown=[], last_case=last_case(out))
+    return _say("\n".join(lines), awaiting=None, price=None, **after_check(out))
 
 
 def _grounded(state, keys: list[str]) -> tuple[str, list[str]] | None:
@@ -403,7 +486,11 @@ def _grounded(state, keys: list[str]) -> tuple[str, list[str]] | None:
 
 
 def _answer(state, parts: list[str], shown: list[str]) -> dict:
-    """A reply to a question asked at the price step also ends that check, and says so."""
+    """A reply to a question asked at the price step also ends that check, and says so. Every reply comes here, so the
+    last check's note is never shown for a message about another order's amount, whichever node picked it."""
+    case = state.get("last_case")
+    if _case_note(case) in shown and _other_order(state.get("last_question") or "", case):
+        parts, shown = [ANOTHER_PAYMENT.format(_case_ref(case))], []
     if state.get("awaiting"):
         return _say("\n\n".join([*parts, CHECK_STOPPED]), shown=shown, awaiting=None, price=None)
     return _say("\n\n".join(parts), shown=shown)
@@ -412,14 +499,18 @@ def _answer(state, parts: list[str], shown: list[str]) -> dict:
 @owns("messages", "shown", "awaiting", "price")
 def question(state):
     if state.get("intent") == "another_payment":  # classify sends it here only after a check
-        return _answer(state, [ANOTHER_PAYMENT.format(state["last_case"]["case_id"][:8])], [])
-    before = state.get("shown") or []  # the last reply's notes: never shown again in full
-    new = [k for k in state.get("entries", []) if k in VERIFIED and k not in before]
+        return _answer(state, [ANOTHER_PAYMENT.format(_case_ref(state["last_case"]))], [])
+    before = state.get("shown") or []  # the last reply's notes: shown again in full only if the answer step fails
+    entries = [k for k in state.get("entries", []) if k in VERIFIED]
+    new = [k for k in entries if k not in before]
     # a follow-up the last reply answers: the sentences classify picked from it, word for word, at most 2
     listed, quoted = _listed(before), {}
     for n in sorted({n for n in state.get("sentences") or [] if 0 < n <= len(listed)})[:2]:
         quoted.setdefault(listed[n - 1][0], []).append(listed[n - 1][1])
-    items = [*quoted.items(), *((k, None) for k in new)][:2]  # the follow-up's answer first; at most 2 notes
+    # a shown note picked again with none of its sentences: a follow-up on all of it (E07 cases 11, 40)
+    whole = [k for k in entries if k in before and k not in quoted]
+    items = [*quoted.items(), *((k, [s for key, s in listed if key == k]) for k in whole),
+             *((k, None) for k in new)][:2]  # the follow-up's answer first; at most 2 notes
     if items:
         # a follow-up answered by the notes just shown, in the LLM's words, from these notes only. A note not shown yet
         # is shown in full: the answer step's prompt says the seller has just read its notes
@@ -427,12 +518,12 @@ def question(state):
         keys = grounded[1] if grounded else [k for k, _ in items]
         parts = []
         if (case := state.get("last_case")) and _case_note(case) in keys:
-            parts.append(f"About your last check (case {case['case_id'][:8]}):")  # its note then says "You saw: …"
+            parts.append(f"About your last check ({_case_ref(case)}):")  # its note then says "You saw: …"
         if grounded:  # only the notes it cites, by title and, for PayPal's, the page
             parts += [grounded[0], "From my notes: " + "; ".join(VERIFIED[k]["title"] for k in keys)
                       + "".join(_source(k) for k in keys)]
         else:
-            parts += [_note(k, sentences) for k, sentences in items]
+            parts += [_note(k, None if k in whole else sentences) for k, sentences in items]
         # at most one closing line, and at the price step it is _answer's CHECK_STOPPED. The check is offered only
         # for a note shown in full for the first time, and never right after a check
         offer = (not grounded and OFFER_CHECK_AFTER & {k for k, sentences in items if sentences is None}
@@ -445,6 +536,54 @@ def question(state):
         return _answer(state, ["I don't have a checked note on that. These PayPal pages may help:\n"
                                + "\n".join(f"{title}: {url}" if title else url for title, url in pages)], [])
     return _answer(state, [DONT_KNOW], [])
+
+
+# an amount with its currency: "40 dollar", "25 USD", "$40". A bare number isn't one: "wait for the other 5" (E07 case 46)
+# Any upper-case code, or PayPal's currencies in any case ("60 usd"): not any 3 letters, or "40 for" would count
+PAYPAL_CURRENCIES = "aud|brl|cad|chf|cny|czk|dkk|eur|gbp|hkd|huf|ils|jpy|mxn|myr|nok|nzd|php|pln|sek|sgd|thb|twd|usd"
+MONEY = re.compile(rf"(?<![\w.,])(?:[$€£]\s*{NUMBER}|{NUMBER}\s*(?:[$€£]|(?i:dollars?|euros?|bucks|{PAYPAL_CURRENCIES})\b"
+                   rf"|[A-Z]{{3}}\b))")
+
+
+def _other_order(text: str, case: dict) -> bool:
+    """An amount in the message and none of them the last check's price or what PayPal showed: about another order."""
+    amounts = {Decimal((m[1] or m[2]).replace(",", ".")) for m in MONEY.finditer(text)}
+    known = {Decimal(case[k].split()[0]) for k in ("price", "paid") if case.get(k)}
+    return bool(case.get("price")) and bool(amounts) and not amounts & known
+
+
+@owns("messages", "shown", "awaiting", "price")
+def advise(state):
+    """can_ship and next_steps, also from _backstop. The LLM only decided that the seller asks; this answers from
+    last_case and shown, with notes and code's words: no answer step, no search, no PayPal call. Never says the seller
+    can ship unless the last check was VERIFIED (its own note says so)."""
+    case, before = state.get("last_case"), state.get("shown") or []
+    key, how = _case_note(case), VERIFIED["vg_how_to_check"]["text"]
+    lead, close, ship = None, scam_check.SUPPORT, state["intent"] == "can_ship"
+    if ship:  # another order's amount: _answer replies another_payment
+        if not key:  # no check, or only an injection since: never "you can ship"
+            return _answer(state, [f"{NO_CHECK_SHIP} {how}"], [])
+        pid = case["policy_id"]
+        head = ONLY_THAT if pid in ("P.VERIFIED", "P.VERIFIED_WARN") else NOT_YET if pid in WAIT_FOR else DONT_SHIP
+        keys, lead = [key], head.format(_case_ref(case))
+    elif "vg_already_shipped" in before:  # the last reply first, then the last check
+        keys = ["vg_already_shipped"]  # never "before you ship" once it has shipped
+    elif sign := next((k for k in before if k.startswith("vg_signal_")), None):
+        keys = [sign, "vg_before_you_ship"]
+        close = OFFER_CHECK if sign in OFFER_CHECK_AFTER and not case else close
+    elif DISPUTE_NOTES & set(before):
+        keys = list(RESPOND_KEYS)
+    elif key:
+        keys, lead = [key], f"About your last check ({_case_ref(case)}):"
+    else:
+        return _answer(state, [_note("vg_before_you_ship"), how], ["vg_before_you_ship"])
+    keys = [k for k in keys if k in VERIFIED]
+    if not ship and keys and set(keys) <= set(before):  # a second "what now?": not the same notes word for word
+        lead, notes = SAME_STEPS, []
+    else:
+        notes = _notes(keys)
+    parts = [*([lead] if lead else []), *notes, *([] if state.get("awaiting") else [close])]
+    return _answer(state, parts, keys)
 
 
 @owns("messages", "shown", "awaiting", "price")
@@ -468,11 +607,11 @@ def other(state):
 
 def _build(checkpointer=None):
     g = StateGraph(State, input_schema=MessagesState)  # input is messages only: nobody sets a price or an intent
-    for node in (classify, start_check, check, question, dispute, other):
+    for node in (classify, start_check, check, question, advise, dispute, other):
         g.add_node(node)
     g.add_conditional_edges(START, route_in, ["check", "start_check", "classify"])
-    g.add_conditional_edges("classify", after_classify, ["question", "start_check", "dispute", "other", "check"])
-    for node in ("start_check", "check", "question", "dispute", "other"):
+    g.add_conditional_edges("classify", after_classify, ["question", "advise", "start_check", "dispute", "other", "check"])
+    for node in ("start_check", "check", "question", "advise", "dispute", "other"):
         g.add_edge(node, END)
     return g.compile(checkpointer=checkpointer)
 

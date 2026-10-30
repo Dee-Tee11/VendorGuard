@@ -1,6 +1,7 @@
 """Evals: made-up conversations of a seller with Vendor Guard's chat, the real Groq model (E07). Opt-in:
 
     pytest -m eval -v -s tests/test_eval_seller.py  EVAL_REPS=3 runs each conversation 3 times
+    EVAL_DATASET=weak pytest -m eval -v -s tests/test_eval_seller.py  runs E08 (tests/seller_weak_dataset.jsonl)
 
 The cases are tests/seller_dataset.jsonl: the seller's messages, one per turn, and PayPal's answer for a check run in
 the chat (mocked: a capture, "not_found", a list of those, one per lookup, or null when there is none;
@@ -12,8 +13,9 @@ blind spots: read the conversations too. It calls Groq with its own key, GROQ_AP
 not in the KPIs. No web search (Tavily is off), so a question without a note gets DONT_KNOW.
 The user's own scores of a run are in tests/eval_baselines/<run>.human.jsonl, by case id: the KPIs show how often the
 judge lands within a point of them (HUMAN). Rewrite a case and its human score no longer applies: drop it there.
-Each run saves every conversation, the checks and the judge's answer to tests/eval_results/seller-<UTC time>.jsonl,
-and the KPIs and every conversation, readable, to the .txt. Made-up messages only: they are all sent to Groq.
+Each run saves every conversation, the checks and the judge's answer to
+tests/eval_results/<UTC day>/seller-<UTC time>.jsonl, and the dataset, the KPIs and every conversation, readable, to
+the .txt. Made-up messages only: they are all sent to Groq.
 """
 import json
 import os
@@ -29,20 +31,25 @@ from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel, ConfigDict
 
 from app import chat, db, llm, output_guardrails
-from tests.test_eval_output_guardrails import ENV, KEY, calls, real_llm, save_results  # noqa: F401  (pytest fixtures)
+from tests.test_eval_output_guardrails import ENV, KEY, KEY_NAME, calls, real_llm, save_results  # noqa: F401  (pytest fixtures)
 from tests.test_scam_check import TID, days_ago, search
 
 JUDGE_KEY = (ENV.get("GROQ_API_KEY_LLM_JUDGE") or "").strip()
 pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY or not JUDGE_KEY,
-                                                   reason="needs GROQ_API_KEY_LLM_EVAL and GROQ_API_KEY_LLM_JUDGE in .env")]
+                                                   reason=f"needs {KEY_NAME} and GROQ_API_KEY_LLM_JUDGE in .env")]
 
-CASES = [json.loads(line) for line in (Path(__file__).parent / "seller_dataset.jsonl").read_text().splitlines()
-         if line.strip()]
+# EVAL_DATASET=weak runs E08: the same harness on the cases E07 failed most (scenarios as E07's), saved as E08-weak-*
+NAME = "weak" if os.getenv("EVAL_DATASET") == "weak" else "seller"
+EVAL_ID = "E08" if NAME == "weak" else "E07"
+DATASET = Path(__file__).parent / f"{'seller_weak' if NAME == 'weak' else 'seller'}_dataset.jsonl"
+CASES = [json.loads(line) for line in DATASET.read_text().splitlines() if line.strip()]
 REPS = int(os.getenv("EVAL_REPS", "1"))
 ROWS = []
 GRAPH = chat._build(InMemorySaver())  # one graph: each case and rep has its own thread_id
 HUMAN = Path(__file__).parent / "eval_baselines" / "seller-20261025T193317Z.human.jsonl"
-HUMAN_ROWS = [json.loads(line) for line in HUMAN.read_text().splitlines() if line.strip()] if HUMAN.exists() else []
+# the user's scores are by E07's case ids: they don't apply to E08's
+HUMAN_ROWS = ([json.loads(line) for line in HUMAN.read_text().splitlines() if line.strip()]
+              if HUMAN.exists() and NAME == "seller" else [])
 HUMAN_SCORES = {r["id"]: r["score"] for r in HUMAN_ROWS if r["score"] is not None}
 JUDGE_PROMPT = (
     "You review a conversation between an online seller and Vendor Guard, an assistant that helps PayPal sellers "
@@ -173,11 +180,11 @@ def report(rows) -> str:
 def results():
     yield
     if ROWS:
-        save_results("seller", ROWS, kpis(ROWS) + "\n" + report(ROWS))
+        save_results(EVAL_ID, NAME, ROWS, kpis(ROWS) + "\n" + report(ROWS), DATASET)
 
 
 @pytest.mark.parametrize("i, rep", [(i, rep) for i in range(1, len(CASES) + 1) for rep in range(REPS)],
-                         ids=[f"{i}-{c['metadata']['kind']}-r{rep}" for i, c in enumerate(CASES, 1) for rep in range(REPS)])
+                         ids=[f"{EVAL_ID}-{i}-{c['metadata']['kind']}-r{rep}" for i, c in enumerate(CASES, 1) for rep in range(REPS)])
 def test_eval_seller(api, monkeypatch, calls, i, rep):
     case, (seen, limited, failed) = CASES[i - 1], calls
     inputs, want = case["inputs"], case["outputs"]
@@ -204,6 +211,9 @@ def test_eval_seller(api, monkeypatch, calls, i, rep):
             # "new_payment": the turn is about a payment the session's check didn't cover
             unchecked = not values.get("last_case") or expected.get("new_payment")
             routes = expected["route"] if isinstance(expected["route"], list) else [expected["route"]]
+            # advise answers the "can I ship?" and "what now?" that question did before 2026-10-30; the expected notes
+            # still catch a real question sent there. The datasets stay as they were, so their sha does too
+            routes = [*routes, "advise"] if "question" in routes else routes
             verdicts = expected.get("verdict") if isinstance(expected.get("verdict"), list) else [expected.get("verdict")]
             shown = lambda keys: [chat.VERIFIED[k]["title"] in reply for k in keys]  # noqa: E731
             sentences, rejected = checked[-1] if len(checked) > n_checked else (0, ["LLM or schema error"])

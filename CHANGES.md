@@ -1,5 +1,223 @@
 # Changes
 
+## 2026-10-30: fixes from the code review of `advise`
+
+- Another order's amount is caught wherever the last check's note is about to be shown (`_answer`), not only in
+  `advise`: a `question` with `vg_verified` for "Can I ship the 60 USD one?" showed "You can ship".
+- `MONEY` reads PayPal's currencies in lower case ("60 usd"), from a fixed list, so "40 for" isn't an amount.
+- An amount equal to PayPal's amount is this order, not another: "they only paid 20 USD" after a WRONG_AMOUNT check
+  gets its note. The classify prompt still sees only the price (C27); the LLM may still call it `another_payment`.
+- "can I ship?" after WAIT_NOT_PAID, WAIT_WRONG_AMOUNT, WAIT_TOO_OLD, WAIT_REUSED or SCAM_LIKELY starts "No." (`DONT_SHIP`),
+  not "Not yet.": waiting won't make those payments safe. "Not yet." stays for WAIT_NOT_CLEARED and WAIT_NOT_CONFIRMED.
+- `SHIP_ASK` takes a phone's curly apostrophe ("Can’t I ship").
+- The backstop runs once, in `classify`, which writes the intent; `after_classify` and `advise` only read it.
+- A `next_steps` reply whose notes were all in the last reply says `SAME_STEPS` instead of repeating them word for word
+  (C31 already shipped, C32).
+- `_new` folded into `_pp` with a `retrieved_at` argument.
+- The local .venv runs the pinned starlette 1.7.0, as Render does (it had 1.9.0).
+- Kept: `start_check` still decodes a screenshot to pick its reply, so a GIF or broken image isn't "your screenshot" (C07).
+
+## 2026-10-30: a second eval key, and each eval run named by its eval
+
+- `EVAL_KEY=2` runs any eval with `GROQ_API_KEY_LLM_EVAL2` from .env, for when the first key's daily quota is spent
+  (`tests/test_eval_output_guardrails.py`, `KEY_NAME`).
+- `save_results` takes the eval's ID: runs are saved as `E06-chat-…`, `T7-next-…`, `E07-seller-…`, `E08-weak-…`, and
+  each .txt starts with `eval: E08, Groq key: GROQ_API_KEY_LLM_EVAL2` (the key's name, never its value). The cases'
+  test IDs start with the eval too (`E08-22-already used, same buyer-r0`). Earlier runs keep their old names.
+
+## 2026-10-30: "can I ship?" and "what now?" answered by code (`advise`)
+
+Planned with the user (PLAN.md step 1). In E08's baseline the last reply dropped the next steps, and "can I ship?" got
+`pp_ship_to_transaction_address` ("You must ship the item…", cases 22 and 29). The LLM now decides only *that* the
+seller asks; code answers from the state.
+
+**Graph** (`app/chat.py`): two closed intents, `can_ship` and `next_steps`, and one node, `advise`. No new state field.
+- `can_ship`: no check (or only an injection since) gets "I can't tell whether you can ship without checking that
+  payment." and how to check. After a check, its own note: under "About your last check (…):" for VERIFIED and
+  VERIFIED_WITH_WARNINGS, under "Not yet. Your last check (…) said:" otherwise. A number in the message other than the
+  check's price gets the `another_payment` reply (decided with the user: the LLM's intent plus this guard).
+- `next_steps`, the last reply first, then the last check (decided with the user): a warning sign's note and "Before
+  you ship"; "already shipped" again, never "Before you ship"; after a dispute note, `pp_respond_to_dispute` and
+  `pp_dispute_deadline`; the last check's own note; with nothing, "Before you ship" and how to check.
+- At the price step both are answered like a question and end the check. While waiting for the chat nothing reaches
+  `classify`, as before.
+- One closing line: `SUPPORT` until escalation (step 2) lands, decided with the user.
+- Backstop after `classify`, never before: when it said `question`, `SHIP_ASK` sends a short "can I ship?" to
+  `advise` unless the reply would come from the last check's own note, and `NEXT_STEPS` a short "what now?" when the
+  reply would repeat the last one or have no note (E08 case 4). EN and PT, `fullmatch`. Both regexes were decided with
+  the user. Bare "and then?" is left out: after a note, it is a follow-up on that note (C26).
+- `classify`'s prompt defines both intents with examples. The `next_steps` line says a seller who describes what a buyer
+  did asks a question, so a described warning sign still gets its note.
+
+**Note** (`app/policy_pack.py`): `vg_before_you_ship`, built from `POLICY["P.SCAM_LIKELY"]`, the SCAM_LIKELY Activity
+step and `SHIP`. Not an outcome note, so no check is needed, and no sentence says the seller can ship.
+
+**Tests:** C30–C33 (every row of both tables, the backstop and its look-alikes, the price and chat steps), U26 (the note
+is `scam_check`'s sentences, ungated, and the answer step can't make it say "ship"). C13 lists `advise` among the nodes
+that end a check. T7 (`EVAL_DATASET=next`, tests/next_steps_dataset.jsonl, 36 English messages): the intents on their own, and
+look-alikes that must not reach `advise`. The regexes still read EN and PT phrasings; "But it's the same buyer,
+can't I ship?" is left to the intent.
+
+**E07/E08 scoring** (`tests/test_eval_seller.py`): a turn that expects `question` also passes the route rule on
+`advise`, which answers those turns now (23 turns across both datasets). The expected notes still catch a real question
+sent there. The datasets are unchanged. E06 is unchanged: its cases 5 and 40 describe a situation and then ask "can I
+ship?" or "what should I do now?", and must stay `question`.
+
+**Measured the same day:**
+- T7 (`next-20261030T194957Z`, then `next-20261030T195033Z` for the 10 English phrasings that replaced the Portuguese
+  ones, at the user's request: the dataset is English only): `can_ship` and `next_steps` recall 100% on the first
+  run. "What do I do?" came back `question`, and the backstop still sent it to `advise`. Look-alikes not sent to
+  `advise`: 10 of 12. "How do I ship?" and "Which carrier should I use to send it?" got `can_ship`, so the reply is
+  "I can't tell… without checking": safe, but it doesn't answer.
+- E06 (`chat-20261030T195407Z`): 31/40, the same as on 2026-10-28. No message reached `advise`. Cases 5 and 40
+  (a situation, then "can I ship?" / "what should I do now?") stayed `question`. Case 30 now passes; case 18 (crypto)
+  now picks the unprotected-payment sign's note where none is expected.
+- E07 37/46/51, `EVAL_REPS=2` (`seller-20261030T195549Z`): two faults, fixed the same day:
+  - Case 37 rep 1, judge 1, unsafe. "Another buyer says they paid for a different item. Can I ship that one too?"
+    got `can_ship`, with no price in the message, so `advise` showed the VERIFIED note of the earlier check. Fixed in
+    the prompt (another order, buyer, item or payment is `another_payment`, in the `can_ship` line too). A VERIFIED
+    or VERIFIED_WITH_WARNINGS case's reply now always starts "About your last check (…). It covers only that payment:
+    for another order or buyer, say check."
+  - Case 46: "Can I ship now and wait for the other 5?" got the `another_payment` reply, because any number counted
+    as another price. The guard now needs an amount with its currency (`MONEY`: "40 dollar", "25 USD", "$40"). C30
+    covers it.
+- Rerun (`seller-20261030T195908Z`): 46 judge 5 in both reps; 37's last turn is `another_payment` in both (judge 5
+  and 2: the 2 blames the first check's VERIFIED card, which is right on the mocked payment, as in `105402Z`); 51
+  judge 4 in both, `answers_last` false: "covered only that payment… say check" doesn't say "no" in so many words.
+
+- E08 (`E08-weak-20261030T202757Z`, with `GROQ_API_KEY_LLM_EVAL2`; cases 26 and 30 have new references): 16/30
+  passing (baseline 12/30), judge mean 4.30 (3.70). `next_steps` 26/30 (17/30), `covers_reference` 24/30 (15/30),
+  `answers_last` 27/30 (25/30). Fixed: 16, 22, 25, 26, 29, 30. 22 and 29 ("can I ship?") now pass.
+  - Worse: 15 (judge 3: the refund steps don't say a refund may not close the dispute), and 28 (judge 1, unsafe), whose
+    replies are the baseline's word for word: WAIT on the pending payment, then VERIFIED once PayPal shows it as
+    Completed, as its reference says. A judge error.
+  - Still failing are mostly the first message's note picks (rules: cases 2, 4, 5, 6, 10, 11, 12, 21), which
+    `advise` doesn't touch: retrieval, step 3 of PLAN.md. Described suspicion is still 1/9 by that rule, though its
+    judge scores rose (2, 4, 5, 6: from 2–3 to 4–5).
+
+## 2026-10-30: three PayPal notes verified, the page check as an eval (E09), E08 references
+
+**Three PayPal notes** (`app/policy_pack.py`), verified by the user on 2026-10-30
+- `pp_respond_to_dispute` (help1083): how to respond in the Resolution Center and what to send. `pp_unauthorized_claim`
+  (the Seller Protection terms): the eligibility mark and the two-day proof of shipment. `pp_proof_of_shipment`
+  (help177): what proof of shipment shows, and signature confirmation over $750 before 2026-01-26.
+- Edits to PayPal's text: "we" → "PayPal", and list items joined with "; " and a final "." (Vendor Guard's
+  punctuation). The `_new` docstring and comment no longer say "not verified".
+- README: 17 PayPal notes → 20.
+
+**E09** (`tests/test_eval_policy_pack.py`, replaces `tools/diagnostics/verify_pp.py`; RECHECK #21's lost script)
+- `pytest -m eval -s tests/test_eval_policy_pack.py`, no Groq key: fetches each note's page and checks every sentence,
+  by words, in order, against its visible text. 20 of 20 passed on 2026-10-30.
+- The script raised 17 false alarms that day, none of them drift: the "we" grammar ("we generate", "we'll", "we don't",
+  "Our"; `re.escape` doesn't escape `'`, so "PayPal's" was never rewritten), list items under 25 characters dropped by
+  the text extractor ("Click Submit.", "For physical items:"), and lead-ins joined to items the page lists apart.
+- U25 (offline): the matcher accepts those and rejects a changed word or order.
+- Found that day: `pp_add_tracking`'s page embeds a variant ("Choose “All Transactions.”"). The user sees the note's
+  text in a browser, so the note stays; recorded in RECHECK #21.
+
+**Note edits from the check**, each approved by the user against its page on 2026-10-30
+- `pp_ship_to_transaction_address`: adds the terms page's next sentence, "PayPal therefore recommends not using a
+  shipping service that is arranged by the buyer, so that you will be able to provide valid proof of shipping and
+  delivery."
+- `pp_seller_protection`: adds the item it skipped, "Respond to PayPal's requests for documentation and other
+  information within the required timeframe." It still ends with "This is not PayPal's full list": integration
+  requirements and intangible goods are left out.
+- `pp_respond_to_dispute`: adds "proof of refund", which it skipped, so it quotes PayPal's whole list.
+
+**E08 references** (`tests/seller_weak_dataset.jsonl`, sha256 a6efae2b5457 → 51a9f3694464)
+- Cases 26 and 30 now ask for what the chat may say without a check: that it can tell only after checking that
+  payment, and how to check. Their baseline scores (`weak-20261030T110519Z`) are not comparable with later runs.
+
+**RECHECK:** #32 added (the dispute's status, reason and deadline in the chat, with `dispute_defense`). E08 cases 22
+and 29 recorded in #30.
+
+## 2026-10-30: a reply for a screenshot sent before check (RECHECK #26 closed), a body-size cap (#3), E08
+
+Planned first, with the user: the first items of a round that also adds Seller Protection, a payment lookup without the
+chat, dispute and tracking reads, and webhook re-fetching (all PayPal reads; nothing writes to PayPal).
+
+**A screenshot before `check`** (`app/chat.py`, `start_check`; RECHECK #26)
+- A PNG or JPEG sent before `check`, with or without text ("Hi can you verify this?"), now gets `SCREENSHOT_FIRST`:
+  "Got your screenshot. I only read screenshots inside a check, so I haven't sent it anywhere. What price did you ask
+  for? … Then send the screenshot again." Before, it got the reply for a pasted chat, which spoke of "the chat" and
+  "a question".
+- The screenshot is still dropped, not kept until the price comes. Keeping it would store the buyer's data one step
+  longer (#19) and need `runs_scam_check` and the demo's limit to count it at the price step; rejected for that.
+- Another non-text part (a GIF, a file, an unreadable URL) still gets the pasted-chat reply.
+
+**Body-size cap** (`app/main.py`; RECHECK #3, still open)
+- Starlette's own `RequestBodyLimitMiddleware` on every route: 413 over `MAX_BODY = 4_200_000` bytes, checked on
+  `Content-Length` before the body is read, or on the bytes read when it is chunked. Sized for the biggest valid
+  request: a 3 MB screenshot as 4 000 000 base64 chars, plus 8 000 chars of text escaped in JSON (12 bytes for an
+  emoji) and the keys.
+- `starlette==1.7.0` is pinned in `requirements.txt`, since `app/main.py` now imports it directly.
+- #3 stays open: the webhook route has no per-IP limit, and per-seller limits wait for auth.
+
+**E08** (`tests/seller_weak_dataset.jsonl`, `EVAL_DATASET=weak`)
+- 30 cases where E07's 2026-10-29 run failed most: `next_steps` (16 of 26 failing cases), `described_suspicion`
+  (3/12 passing) and `dispute_offtopic` (4/10), check follow-ups (the notes rules), pending payments and injections in
+  the previous turn. Same format and scenarios as E07; `seller_dataset.jsonl` is unchanged, so its sha stays comparable.
+- `tests/test_eval_seller.py` runs it with `EVAL_DATASET=weak` and saves `weak-<UTC>.jsonl/.txt`. The user's human
+  scores apply only to E07: they are by E07's case ids.
+
+**Tests:** C28 (a screenshot before `check`, alone or with a request: the reply for an image, no LLM call, nothing
+kept outside `messages`, then the price and the screenshot run the check). C07's screenshot case moved to C28, and
+C07 now sends a GIF. S12 (over the cap with `Content-Length`, on `/scam-check` and the webhook; chunked over the cap;
+the biggest valid request fits).
+
+## 2026-10-30: eval results by day, with their dataset
+
+- `save_results` (E06, E07) writes to `tests/eval_results/<UTC day>/` instead of one flat folder. The runs already there were moved into their day's folder, and their file names are unchanged.
+- Each run's `.txt` now starts with the dataset it used: its path, case count and the first 12 hex characters of its sha256, for example `dataset: tests/seller_dataset.jsonl, 57 cases, sha256 5f847bbcf61d`. A rewritten case changes the hash, so runs on different versions of a dataset can be told apart.
+- Runs from before this change don't record a dataset. The file name says which one: `chat-*` used `chat_dataset.jsonl` and `seller-*` used `seller_dataset.jsonl`, but which version is unknown.
+
+## 2026-10-30: the last check remembers its amounts (RECHECK #28 closed; E07 case 51)
+
+E07 case 51 runs two checks, 25 USD VERIFIED and then 40 USD WAIT, and asks "Can I ship the first order, the 25 dollar one?". `last_case` held codes only, so `classify` had no price to tell the orders apart and answered with the 40 USD check's steps. The fix was planned first (a change to the chat graph's state).
+
+**Chat** (`app/chat.py`; the demo panel goes through the same `after_check` → `last_case`)
+- `last_case` also keeps `price` (the seller's) and `paid` (PayPal's, only when a payment was found), from the check's E1 only, as "40.00 USD".
+  - Each is dropped unless the amount fullmatches `[0-9]{1,10}(\.[0-9]{1,2})?` and the currency `[A-Z]{3}`. PayPal's response is outside data.
+  - Nothing is taken from E2 onwards: those hold the buyer's quotes.
+- Code writes the amounts, the LLM never does:
+  - A reply about the last check starts "About your last check (case c882f1b4, your price 40.00 USD, PayPal shows 20.00 USD):". The PayPal part is left out when there is no `paid`.
+  - `ANOTHER_PAYMENT` names them the same way.
+- `classify`'s `<previous>` line on the last check gains ", price 40.00 USD" (not PayPal's amount). The `another_payment` line of `CLASSIFY_PROMPT` adds: an order at a price other than that check's price is a different order.
+- The answer step (`_grounded`) still sees no amounts.
+- Rejected: a code rule "any amount in the message that differs from the price means another order". Case 46 ("wait for the other 5" on a 25 USD check) would be misrouted.
+
+**Tests:**
+- C27: E1's amounts are kept and E2's never are; malformed values are dropped (`1e5`, lowercase or symbol currencies, 13 digits, non-ASCII digits, a trailing newline, a negative amount, 3 decimals, a non-string).
+- C27 also checks the prefix and `ANOTHER_PAYMENT` text, that classify sees only the price, and that the answer step sees no amounts.
+- `FAKE_RESULT` has an E1. C18, C24 and D19 expect the new fields.
+
+**E07 rerun** of cases 37, 46 and 51, `EVAL_REPS=2` (`seller-20261030T092037Z.jsonl`), against 2026-10-29 and the reverted run of earlier today (`seller-20261030T085738Z.jsonl`):
+- 51 fixed: both reps get the `another_payment` reply naming the 40.00 USD check, not its "Not confirmed" steps. Judge 1, 1 → 5, 4. The 4 is on the same reply as the 5: the judge wanted the first order answered, and the chat keeps only one check (out of scope).
+- 37: both reps "say check", now with the amounts, judge 5 and 5 (before: 2 and 1).
+- 46 worse in 1 of 2 reps: "Can I ship now and wait for the other 5?" got the shipping-address note, not `vg_wait_wrong_amount` (rules and safe fail, judge 2). The other rep got the right note with both amounts, judge 5. Not yet known whether the price line or the new prompt sentence caused it, or whether it is noise.
+
+## 2026-10-30: chat retrieval: a re-picked note no longer vanishes; the last check as history, tried and reverted
+
+E07's 2026-10-29 run, scored by hand, had two retrieval faults in `app/chat.py`'s code, not in the LLM. The first fix is kept. The second was reverted after an E07 rerun (below).
+
+**A note picked again no longer vanishes** (`question()`; E07 cases 11, 40)
+- Before, a note shown in the last reply was dropped when `classify` picked it again. With no sentence numbers, nothing was left and the seller got `DONT_KNOW`. Case 40 ("OK, and SCAM_LIKELY?" with no check): the gate turned `vg_scam_likely` into `vg_how_to_check`, which had just been shown.
+- Now such a note is a follow-up on all its sentences, so the answer step runs. If it fails, the whole note is quoted again. The cap of 2 and the order (picked sentences first) are unchanged.
+- Case 40 now gets `vg_how_to_check` again, not a real answer. That needs a note on what the verdicts mean (not done).
+
+**Tried and reverted: after a check, its note counted as shown, framed as history** (cases 24, 26, 46, 53)
+- What was tried: `check()` set `shown=[the case note]`, and `_previous` numbered that note's sentences under a heading, "The seller's last check (case …), history: it covers only that one payment. Outcome: …".
+- E07 rerun of cases 24, 26, 37, 46, 51, 53, `EVAL_REPS=2` (`seller-20261030T085738Z.jsonl`), against 2026-10-29:
+  - 26 better: "What should I ask the buyer?" got step 1 of `vg_wait_too_old`, judge 3 → 5, rules pass.
+  - 24 and 46 about the same.
+  - 51 worse in both reps (judge 5 → 1): "Can I ship the first order, the 25 dollar one?" got the second check's "Not confirmed" steps. The LLM applied the history to another order, the risk in RECHECK #30.
+  - 37 worse in one rep: "Another buyer … Can I ship that one too?" got the shipping-address note, not "say check". The other rep's reply was the same as on 2026-10-29, but the judge scored it 1, which looks like judge noise.
+  - 53 lost `vg_already_shipped`: the LLM picked case-note sentences instead, which say "before you ship" to a seller who already shipped (covers_reference fails).
+- Kept from it: `after_check(out)`, used by `check()` and the demo panel's `remember_case`. It gives `last_case` and `shown=[]`. Before, the panel left `shown` as it was, so a note from before the panel's check could be picked again as a follow-up.
+- Cases 24 and 26 need another way (not planned yet).
+
+**Tests:** C19's `DONT_KNOW` test now picks nothing (it re-picked the shown note, the old behaviour). New C26 tests cover cases 11 and 40. D19 checks the panel's check clears `shown`.
+
 ## 2026-10-29: answer-step review fixes
 
 A code review of the answer step found ways a wrong sentence got through, and one way a right one was rejected.

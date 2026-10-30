@@ -178,9 +178,9 @@ def _thread(session_id: str) -> dict:
 
 
 def remember_case(session_id: str, result: dict) -> None:
-    """The check panel's case, in the session's chat thread, so the chat can answer "what do I do now?" about it.
-    Call it inside busy(): no chat message may change the thread at the same time."""
-    chat_graph.update_state(_thread(session_id), {"last_case": chat.last_case(result)}, as_node="check")
+    """The check panel's case, in the session's chat thread, as a chat check leaves it, so the chat can
+    answer "what do I do now?" about it. Call it inside busy(): no chat message may change the thread at the same time."""
+    chat_graph.update_state(_thread(session_id), chat.after_check(result), as_node="check")
 
 
 def runs_check(session_id: str, message: str, image: bytes | None = None) -> bool:

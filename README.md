@@ -19,7 +19,7 @@ PayPal is the source of truth in both graphs, and nothing that moves money happe
 | Seller authentication, single-use approval tokens | In progress |
 | `scam_check` graph and `POST /scam-check` | Done, screenshots included (U01–U05, U09–U10, U17–U20, N01–N04, S01–S06) |
 | Live sandbox demo (`/demo`): sell, pay as a test buyer, check the chat, ask the chat, watch every step | Built, and run locally against the sandbox with a real payment (D01–D17). Needs a Render deploy |
-| `chat` graph and `policy_pack` | Done in Studio and on the demo page through `POST /demo/api/chat` (C01–C25, U16, U22, E06, E07, D12–D17). No endpoint outside the demo until auth lands |
+| `chat` graph and `policy_pack` | Done in Studio and on the demo page through `POST /demo/api/chat` (C01–C33, U16, U22, U26, E06, E07, E08, T7, D12–D17). No endpoint outside the demo until auth lands |
 | `dispute_defense` graph, approval screen, Bryntum board | Planned, 1–7 Nov |
 | Evaluation set, published numbers, demo video | Planned, 8–12 Nov |
 
@@ -112,16 +112,17 @@ flowchart TD
   R -- "check", or looks like a pasted chat --> S[start_check]
   R -- otherwise, also any other text at the price step --> C[classify: LLM]
   C -- question or another_payment --> Q[question]
+  C -- "can_ship or next_steps, or a question the backstop reads as one" --> A[advise]
   C -- scam_check --> S
   C -- dispute --> D[dispute]
   C -- other or not_paypal --> O[other]
-  C -- anything but question or dispute, at the price step --> K
+  C -- anything but question, dispute, can_ship or next_steps, at the price step --> K
 ```
 
-One Groq call per message, `classify`, picks closed choices only: an intent (`question`, `scam_check`, `dispute`, `not_paypal`, `another_payment` or `other`) up to 2 keys of verified `policy_pack` notes, best first, and, for a follow-up, the numbers of up to 2 sentences of the notes just shown.
+One Groq call per message, `classify`, picks closed choices only: an intent (`question`, `scam_check`, `dispute`, `not_paypal`, `another_payment`, `can_ship`, `next_steps` or `other`) up to 2 keys of verified `policy_pack` notes, best first, and, for a follow-up, the numbers of up to 2 sentences of the notes just shown.
 
-- **What it sees:** the current message, sanitised and inside `<question>` tags; the titles of the verified notes; and, when there is one, a `<previous>` block, also sanitised: the seller's last message that `classify` read, the notes in the last reply, numbered sentence by sentence, and the last check's outcome as codes (its label, its note's key and the labels of its warning signs).
-- **What it never sees:** the buyer's chat, a check's quotes, amounts or evidence, or search results.
+- **What it sees:** the current message, sanitised and inside `<question>` tags; the titles of the verified notes; and, when there is one, a `<previous>` block, also sanitised: the seller's last message that `classify` read, the notes in the last reply, numbered sentence by sentence, and the last check's outcome as codes (its label, its note's key and the labels of its warning signs) with the seller's price for it, so another order's price reads as another order.
+- **What it never sees:** the buyer's chat, a check's quotes or evidence, the amount PayPal shows, or search results.
 - **What it can't do:** it has no tools and writes no text the seller reads.
 
 A follow-up answered from notes makes a second call, the **answer step** (`_grounded` inside `question`, not a node of its own, so nothing new is kept in the state). It runs only when every note `classify` left for this message was in the last reply and it picked sentences from it; a note the seller hasn't seen yet is shown in full. So never on a first question, right after a check, at the price step, or for a dispute.
@@ -130,7 +131,7 @@ A follow-up answered from notes makes a second call, the **answer step** (`_grou
 - **What it never sees:** the buyer's chat, a check's evidence or quotes, amounts, search results, or a message that matched `INSTRUCTION` (that one never gets past `classify`).
 - **What it writes:** 1 to 3 sentences, each with the numbers of the note sentences it relies on. `output_guardrails.check_answer` checks them in code. If any sentence fails, or the call fails, the seller gets the reply below that quotes the notes, as if the step hadn't run.
 
-The context lives in three state fields, never in `messages` (the demo clears those every turn): `last_question` (written by `classify`), `shown` (by every node that replies) and `last_case` (`{case_id, policy_id, signals}`, by `check`, and by the demo's check panel). The graph's input is `messages` only, so a client can't set them.
+The context lives in three state fields, never in `messages` (the demo clears those every turn): `last_question` (written by `classify`), `shown` (by every node that replies) and `last_case` (`{case_id, policy_id, signals}` plus, from the check's E1 only, `price` and `paid`, the seller's price and PayPal's amount as "40.00 USD", each dropped unless it matches a strict regex; by `check`, and by the demo's check panel). A reply about the last check, and the `another_payment` reply, name those amounts in code's words: "About your last check (case c882f1b4, your price 40.00 USD, PayPal shows 20.00 USD):". The graph's input is `messages` only, so a client can't set them.
 
 Every reply is written in `app/chat.py`, by `scam_check`, or comes from PayPal (a page title and its link), except a follow-up's answer step, which is checked as above. The replies are in English.
 
@@ -145,12 +146,17 @@ Every reply is written in `app/chat.py`, by `scam_check`, or comes from PayPal (
   - A reply ends with at most one closing line: "I stopped the check…" at the price step, else "Want me to check the payment in PayPal? Say check." (offers the check without starting it) when a note about a payment scam is shown for the first time and there was no check, else "Still unsure? … Contact PayPal" when a Vendor Guard note carried it. Not offered for an address, a courier or WhatsApp: there is no payment to check.
   - If no note fits, Tavily searches PayPal's US pages, and the chat lists up to 3 titles and links that start with `https://www.paypal.com/us/` (filtered in code).
   - If the search finds nothing, fails, or there is no key, the reply is "I don't have that information" and PayPal's US business help link.
+- **advise** (`can_ship`, "can I ship?", and `next_steps`, "what now?"): the LLM only decided that the seller asks; code answers from `last_case` and `shown`, with notes and its own words. No answer step, no search, no PayPal call.
+  - `can_ship` with no check (or only an injection since): "I can't tell whether you can ship without checking that payment." and how to check. After a check: its own note, under "About your last check (…). It covers only that payment: for another order or buyer, say check." for VERIFIED and VERIFIED_WITH_WARNINGS, under "Not yet. Your last check (…) said:" for WAIT_NOT_CLEARED and WAIT_NOT_CONFIRMED, which can still change, and "No. Your last check (…) said:" for the other WAITs and SCAM_LIKELY. So only a VERIFIED check's note ever says "You can ship". An amount with its currency ("40 dollar", "25 USD", "60 usd", "$40") other than both the check's price and PayPal's amount gets the `another_payment` reply, from any node about to show the check's note (`_answer`); a bare number ("the other 5") doesn't count.
+  - `next_steps`, the last reply first, then the last check: after a warning sign's note, that note and "Before you ship" (`vg_before_you_ship`, built from `POLICY["P.SCAM_LIKELY"]`, the SCAM_LIKELY Activity step and `SHIP`, no check needed); after "already shipped", that note again and never "Before you ship"; after a dispute note, PayPal's notes on how to respond and by when (`pp_respond_to_dispute`, `pp_dispute_deadline`); else the last check's own note; with neither, "Before you ship" and how to check.
+  - One closing line, as in `question`: "Still unsure? … Contact PayPal", the check offer after a payment scam's sign with no check, or "I stopped the check…" at the price step.
+  - **Backstop, after `classify` and never before** (so "what should I do if a buyer asks for F&F?" is classified by the LLM): when the LLM said `question`, a short EN/PT regex read with `fullmatch` sends the message to `advise` (`classify` applies it and writes the intent, so the router and `advise` only read it). `SHIP_ASK` ("can I ship?", "posso enviar?") does so unless the reply would come from the last check's own note; `NEXT_STEPS` ("what now?", "o que faço?") only when the reply would repeat the last one or have no note. T7 measures both on look-alikes. A `next_steps` reply whose notes were all in the last reply says "The notes in my last reply are all I have on this." instead of showing them again.
 - **scam_check:**
   - The code asks for the price ("25.00 USD"), reads it with a regex and validates it like `POST /scam-check`. Then it asks for the buyer's chat.
   - That next message goes to `scam_check.run()` exactly as typed, with no classification and no search. "cancel" stops at either step.
   - At the price step, text that is neither a price, a pasted chat nor "cancel" goes to `classify`. A question or a dispute is answered and ends the check, and the reply says so. Anything else gets "I need the amount…" again, so "twenty five euros" is still asked again. The chat step never goes to `classify`: what comes there is the buyer's.
   - The reply is the verdict, the message and the sentences, never the evidence, which holds the buyer's quotes.
-  - Instead of the chat, the seller can send a screenshot of it (PNG or JPEG, as a base64 `data:` URL in an `image_url` part, checked by its first bytes) with or without text. It goes to `scam_check.run()` like a screenshot sent to `/scam-check`, and counts as a check and a screenshot on the demo. A screenshot sent at any other step is never read: it starts the check, like a pasted chat. If it can't be read, the seller is asked again.
+  - Instead of the chat, the seller can send a screenshot of it (PNG or JPEG, as a base64 `data:` URL in an `image_url` part, checked by its first bytes) with or without text. It goes to `scam_check.run()` like a screenshot sent to `/scam-check`, and counts as a check and a screenshot on the demo. A screenshot sent before `check` is never read or kept: it starts the check, and the reply, written for an image, asks for the price and then for the screenshot again. If it can't be read, the seller is asked again.
 - **dispute:** fixed text, plus the 2 notes `classify` ranked first, or the first 2 dispute notes if it picked none. Once `dispute_defense` exists, this is where the chat will ask for the dispute ID.
 - **other:** the first time (`greeted`, a state field), what Vendor Guard does and how to start a check. After that, one line on what Vendor Guard can help with, or a short goodbye ("thanks", "bye"). The word `notes`, sent alone, gets the titles of the verified notes instead, with no `classify` call.
 - **not_paypal:** a check or a dispute that isn't on PayPal (a bank transfer, another app, another marketplace) goes to the same node, which says Vendor Guard only works with PayPal.
@@ -231,7 +237,7 @@ Fields in the LangGraph state are owned by the node that writes them (an `@owns(
 - An entry is shown, or offered to the LLM, only once a person has read its source page and set `verified: True` (test U16).
 - There are two kinds of entry:
   - **Vendor Guard notes:** the verdicts, why WAIT, what to do after each outcome, what to do about each warning sign (`vg_signal_*`) and after shipping without being paid, and how to ask for a check. They are built from `scam_check`'s own texts (`STEPS`, `SIGNAL_STEPS`, `SUPPORT`) and are verified.
-  - **PayPal notes:** 17 of them, each from one `https://www.paypal.com/us/` page, with the page's sentences word for word. The only edit is "we" → "PayPal". All are verified (2026-10-22). Two quote only part of a list of requirements (`pp_seller_protection`, `pp_proof_of_delivery`), so they end with a sentence of Vendor Guard's own: "This is not PayPal's full list", with the page's link.
+  - **PayPal notes:** 20 of them, each from one `https://www.paypal.com/us/` page, with the page's sentences word for word. The only edit is "we" → "PayPal", and list items joined with "; ". All are verified: 17 on 2026-10-22, 3 on 2026-10-30. E09 checks every sentence against its page today. Two quote only part of a list of requirements (`pp_seller_protection`, `pp_proof_of_delivery`), so they end with a sentence of Vendor Guard's own: "This is not PayPal's full list", with the page's link.
 - The region is set once, in `REGION`.
 - No PayPal US page says refunds must go only through PayPal, so the refund note says only how to refund in PayPal. Response deadlines are given only where a US Help Center page states them (10 days for a dispute). Seller Protection depends on region, and for the demo it assumes a US sandbox business account. It does not cover "Significantly Not as Described", so the agent never promises protection on a SNAD dispute.
 
@@ -268,7 +274,7 @@ Next to the steps, a live panel shows each `scam_check` node as it runs and what
 |---|---|---|
 | `GET /healthz` | Built | `{"ok": true}` |
 | `POST /webhooks/paypal` | Built | `{"status": "stored"}` or `{"status": "duplicate"}`. 400 on invalid JSON or a bad signature. A 5xx if PayPal is unreachable, so PayPal retries. |
-| `POST /scam-check` | Built | Body `{text, image, expected_amount, expected_currency}`. Send `text`, `image` or both. `image` is a base64 PNG or JPEG with no `data:` prefix, up to 3 MB. The chat may be up to 8 000 chars after sanitising, counting the screenshot's text. Returns `{case_id, verdict, message, sentences, evidence, template, signals_checked, persisted}`, never the chat or the screenshot's text. 422 on bad input or a screenshot that can't be read, 429 over 10 checks (3 with a screenshot) an hour per IP, 503 when two checks are already running. Not authenticated yet (RECHECK #3). |
+| `POST /scam-check` | Built | Body `{text, image, expected_amount, expected_currency}`. Send `text`, `image` or both. `image` is a base64 PNG or JPEG with no `data:` prefix, up to 3 MB. The chat may be up to 8 000 chars after sanitising, counting the screenshot's text. Returns `{case_id, verdict, message, sentences, evidence, template, signals_checked, persisted}`, never the chat or the screenshot's text. 422 on bad input or a screenshot that can't be read, 429 over 10 checks (3 with a screenshot) an hour per IP, 503 when two checks are already running. Not authenticated yet (RECHECK #3). Every route answers 413 to a body over 4.2 MB, before reading it. |
 | `GET /demo` | Built, `DEMO_MODE` only | The demo page. Every `/demo*` route is 404 without `DEMO_MODE=true`. |
 | `POST /demo/api/session` | Built, `DEMO_MODE` only | `{session_id, client_id, currency, buyer_email, buyer_password}`. The other demo routes need the id in `X-Demo-Session`, and answer 401 once the session ended or went idle. |
 | `POST /demo/api/orders`, `POST /demo/api/orders/{id}/capture` | Built, `DEMO_MODE` only | Create a USD order for `{item, amount}`, then capture it: `{capture_id, status, amount, currency}`. 404 for another session's order, 502 when PayPal refuses. |
@@ -329,7 +335,7 @@ Copy `.env.example` to `.env` (it is gitignored).
 | `PAYPAL_BASE_URL` | Defaults to `https://api-m.sandbox.paypal.com`. Set to `https://api-m.paypal.com` for live, in `.env` and `render.yaml`. |
 | `DATABASE_URL` | Postgres connection string. The tables are created on startup. |
 | `GROQ_API_KEY` | From console.groq.com. Required: the app does not start without it. The free tier (8K tokens/min) fits about 2 checks a minute. |
-| `GROQ_API_KEY_LLM_EVAL`, `GROQ_API_KEY_LLM_JUDGE` | Tests only: the evals (`pytest -m eval`) call Groq with these, never with `GROQ_API_KEY`, so they don't spend the app's daily quota. The second is E07's judge. |
+| `GROQ_API_KEY_LLM_EVAL`, `GROQ_API_KEY_LLM_EVAL2`, `GROQ_API_KEY_LLM_JUDGE` | Tests only: the evals (`pytest -m eval`) call Groq with these, never with `GROQ_API_KEY`, so they don't spend the app's daily quota. The second is E07's judge. |
 | `LLM_MODEL` | Defaults to `openai/gpt-oss-120b`. Must be a Groq model with strict JSON-schema output. |
 | `TAVILY_API_KEY` | From app.tavily.com. Optional: without it the app starts, and a chat question with no note gets PayPal's help link. Turn off "Allow Use of Query Data" in the Tavily account (see Graph 3). |
 | `DEMO_MODE` | `true` turns on the live demo (`/demo`). Sandbox only: the app refuses to start with it against live PayPal. Off when unset. |
@@ -392,7 +398,9 @@ pytest -m eval -v    # evals: the real Groq model, keys from .env, made-up chats
 
 The evals have their own Groq keys, `GROQ_API_KEY_LLM_EVAL` for the app's calls and `GROQ_API_KEY_LLM_JUDGE` for E07's judge, so a run doesn't spend the app's daily quota (200K tokens a day for `gpt-oss-120b` on the free tier). Groq's limits are per organization and per model, so the keys only add quota when they come from different organizations. With `LANGSMITH_TRACING=true` in `.env`, every eval is traced to the LangSmith project `vendorguard-evals`, never the dev one, and each test's traces are sent when it ends, so a run can be followed live. The offline tests are never traced.
 
-The plan has 61 test cases in six layers, plus C01–C25 for the chat and D01–D19 for the demo, tracked by ID:
+`EVAL_KEY=2` runs an eval with `GROQ_API_KEY_LLM_EVAL2` instead, for when the first key's daily quota is spent. Each run is saved as `<eval>-<dataset>-<UTC time>` (`E06-chat-…`, `T7-next-…`, `E07-seller-…`, `E08-weak-…`), its .txt starts with the eval and the name of the key it used (never the value), and each case's test ID starts with the eval (`-k "E08-22"`). Runs before 2026-10-30 20:30 UTC are named without the eval.
+
+The plan has 61 test cases in six layers, plus C01–C33 for the chat and D01–D19 for the demo, tracked by ID:
 
 | Layer | IDs | What it covers | Where it runs |
 |---|---|---|---|
@@ -400,7 +408,7 @@ The plan has 61 test cases in six layers, plus C01–C25 for the chat and D01–
 | Node (mock) | N01–N10 | LLM and API nodes against simulated PayPal errors (429, 503, `ERRDIS…`) | CI |
 | Sandbox | G01–G12 | End to end on PayPal Sandbox, including resume after restart | manual scripts |
 | Security | S01–S11 | Prompt injection, forged webhooks, token replay, no tools on LLM nodes | pytest + promptfoo |
-| Chat | C01–C25 | `app/chat.py`: routing, the check flow, screenshots, Tavily, links, personal data | CI, Groq and Tavily mocked |
+| Chat | C01–C33 | `app/chat.py`: routing, the check flow, screenshots, Tavily, links, personal data | CI, Groq and Tavily mocked |
 | Demo | D01–D19 | `/demo`: off by default, sandbox only, sessions, orders, the streamed check, the chat, per-IP limits | CI, PayPal and Groq mocked |
 | Evaluation | E01–E05 | 60 labelled chats, 20 sandbox disputes, 30 injection variants, 50 drafts | scripts + RAGAS |
 | Spike | P01–P02 | Which payment source feeds the ledger, and whether simulator events verify | manual |
@@ -420,20 +428,25 @@ The plan has 61 test cases in six layers, plus C01–C25 for the chat and D01–
     - The answer step's KPIs: how often it was grounded or fell back, and its sentences per grounded reply. The report shows the rules that rejected each fallback. Case 57 is an injection aimed at it.
     - An LLM judge then scores each whole conversation against a reference written from `policy_pack`'s notes: correct, next steps, whether the last reply answers the last message, safe, covers the reference, and 1–5. The judge is the app's own model, so read the conversations too.
     - The user's own scores of the baseline are in tests/eval_baselines/*.human.jsonl. The KPIs show how often the judge lands within a point of them: on the baseline, the judge was too lenient when an earlier turn covered the reference and the last one failed.
-    - Each run saves every conversation to tests/eval_results/, with the KPIs per rule, per criterion and per scenario. The first run (15/35 passing, judge mean 3.89) is kept in tests/eval_baselines/ to compare later runs against.
+    - Each run saves every conversation to tests/eval_results/<UTC day>/, with the KPIs per rule, per criterion and per scenario. The .txt starts with the dataset used: its path, case count and sha256. The first run (15/35 passing, judge mean 3.89) is kept in tests/eval_baselines/ to compare later runs against.
+  - E08 (`EVAL_DATASET=weak pytest -m eval -s tests/test_eval_seller.py`): E07's harness on the 30 cases of tests/seller_weak_dataset.jsonl, where E07 failed most: warning signs and disputes followed by "what next?", check follow-ups, pending payments, and injections in the previous turn. Saved as `E08-weak-*` in tests/eval_results/; the human scores apply to E07 only.
+  - E09 (tests/test_eval_policy_pack.py, `pytest -m eval -s`, no Groq key): fetches each PayPal note's page and checks that every sentence is still on it, word for word, undoing "we" → "PayPal". Prints the closest line on the page for a sentence it misses. U25, its matcher on fixed strings, runs offline. Run it before a demo: pages change.
   - Screenshot evals (tests/test_eval_screenshot.py): drawn PT and EN chats, one with an injection, must be copied word for word with the ID and the right `Buyer:`/`Seller:` labels. A blurred chat must not be guessed, and a screenshot alone run through the whole graph must give `SCAM_LIKELY`.
   - Screenshots, offline: a screenshot alone, a screenshot plus text, bad uploads, a failed copy (no verdict, no case, PayPal not called), and no tools or secrets in the vision call (S03).
   - N01–N04: PayPal 404, 403, 429, 503, timeouts, token failure, Transaction Search rows, LLM and database failures.
   - S01–S06: prompt injection, unverifiable quotes, no tools and no secrets in prompts, no ship wording from the LLM, Unicode and tag tricks.
+  - S12: a body over 4.2 MB is a 413 before it is read, with or without `Content-Length`; the biggest valid `/scam-check` request fits.
 - `chat` (tests/test_chat.py):
   - C01–C17: every intent, the price and the chat flow, a screenshot at the chat step, and cancel.
   - C18–C21: the context (the last check's codes reach `classify`, its quotes don't; the input can't set it; a new check or cancel forgets it), a note just shown is answered from its picked sentences, never repeated whole, a question at the price step, and the check offered after a described scam.
   - C22–C24: no outcome note without its own check, instructions never classified, another payment.
+  - C30–C33: `advise`. Every row of the `can_ship` and `next_steps` tables, "You can ship" only after a VERIFIED check, another price, after an injection; the backstop for "what now?" and "can I ship?" and look-alikes that stay questions; at the price step, and never while waiting for the chat. U26: `vg_before_you_ship` is `scam_check`'s own sentences, ungated, and the answer step can't turn it into "you can ship".
   - C25: the answer step. A follow-up is answered in sentences that cite its notes; an LLM error, a schema error, no sentences, one bad sentence, an injected flip or "ship" without a check all give the quoted reply, byte for byte; no answer step on a first question or right after a check, and no buyer chat in its prompt; "ship" only from the last check's own note.
   - The buyer's chat never reaches the chat's LLM or Tavily, and no quotes appear in the reply or in the thread.
   - Pasted chats, the tag injection, the link filter, Tavily failures, personal data in the search, one Groq request per message (two on a follow-up), no tools or secrets.
   - U16: the `policy_pack` sources, and that unverified notes are never offered or shown.
-  - E06 (tests/test_eval_classify_chat.py, `pytest -m eval -s`): the 39 cases in tests/chat_dataset.jsonl, all in English, the real Groq model. Each run saves every reply and the KPIs (routing, intent, notes shown, LLM calls) to tests/eval_results/, which git ignores. Each call uses about 830–890 tokens, about 1,600 for a dispute. No SDK retries, as in the app: a 429 waits 60 s and tries once more.
+  - E06 (tests/test_eval_classify_chat.py, `pytest -m eval -s`): the 39 cases in tests/chat_dataset.jsonl, all in English, the real Groq model. Each run saves every reply and the KPIs (routing, intent, notes shown, LLM calls) to tests/eval_results/<UTC day>/, which git ignores. The .txt starts with the dataset, as in E07. Each call uses about 830–890 tokens, about 1,600 for a dispute. No SDK retries, as in the app: a 429 waits 60 s and tries once more.
+  - T7 (`EVAL_DATASET=next pytest -m eval -s tests/test_eval_classify_chat.py`): E06's harness on the 36 single messages of tests/next_steps_dataset.jsonl: "can I ship?" and "what now?" phrasings, in English, and look-alikes that are questions or disputes ("how do I ship?", "what should I do if a buyer asks for F&F?"). KPIs: recall of `can_ship` and `next_steps`, and look-alikes not sent to `advise`. Saved as `T7-next-*`.
 - Demo (tests/test_demo.py): D01–D17. The routes are 404 when off, the app won't start against live PayPal, another session's order is never captured, the stream lists every node and PayPal call (no token) and ends with the same verdict as `/scam-check`, a busy check is an error line and every check gives its slot back, and the per-IP limits ignore forged `X-Forwarded-For` entries. The chat answers from a verified note, runs a check over three messages on its own session's thread (counted as a check, its case tied to the session), refuses that message with 503 when no slot is free, takes one message at a time per session (409), counts a chat screenshot as a check and a screenshot, and forgets the thread when the session ends or is swept. D19: the check panel's outcome becomes the chat's last case, and the panel and the chat take turns.
 
 The tests mock PayPal and Groq and replace the database calls, so they need neither credentials nor Postgres. `tests/test_db.py` runs the real SQL (the claims, saving a case, the demo's tables and its cleanup) against a throwaway Postgres, and is skipped unless `TEST_DATABASE_URL` is set:

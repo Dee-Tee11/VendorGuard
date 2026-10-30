@@ -7,7 +7,9 @@ GROQ_API_KEY_LLM_JUDGE for E07's judge (conftest swaps the environment's key for
 in .env, each eval is traced to LangSmith's project vendorguard-evals, never the dev one, to follow a run as it goes.
 Made-up chats only: everything here is sent to Groq. The other eval files import the key and fixtures from here.
 """
+import hashlib
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,10 +25,12 @@ from app import db, llm, scam_check
 from tests.test_scam_check import TID, capture, search
 
 ENV = dotenv_values(Path(__file__).parent.parent / ".env")
-KEY = (ENV.get("GROQ_API_KEY_LLM_EVAL") or "").strip()
+# EVAL_KEY=2 uses GROQ_API_KEY_LLM_EVAL2, a second key for when the first one's daily quota is spent
+KEY_NAME = "GROQ_API_KEY_LLM_EVAL" + os.getenv("EVAL_KEY", "")
+KEY = (ENV.get(KEY_NAME) or "").strip()
 # only the evals trace, never the offline tests: their own project, the endpoint and key from .env
 TRACING = {k: v for k, v in ENV.items() if k.startswith("LANGSMITH_") and v} | {"LANGSMITH_PROJECT": "vendorguard-evals"}
-pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason="needs GROQ_API_KEY_LLM_EVAL in .env")]
+pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason=f"needs {KEY_NAME} in .env")]
 
 
 @pytest.fixture(autouse=True)
@@ -75,10 +79,18 @@ def calls(monkeypatch):
     return seen, limited, failed
 
 
-def save_results(name: str, rows: list[dict], report: str):
-    """Every row to tests/eval_results/<name>-<UTC time>.jsonl, the KPIs next to it in a .txt."""
-    (out := Path(__file__).parent / "eval_results").mkdir(exist_ok=True)
-    path = out / f"{name}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.jsonl"
+def save_results(eval_id: str, name: str, rows: list[dict], report: str, dataset: Path):
+    """Every row to tests/eval_results/<UTC day>/<eval_id>-<name>-<UTC time>.jsonl, the KPIs next to it in a .txt that
+    starts with the eval, the Groq key's name (never its value) and the dataset: its path, case count and sha256, so a
+    run can be matched to the dataset's version."""
+    now = datetime.now(timezone.utc)
+    (out := Path(__file__).parent / "eval_results" / f"{now:%Y-%m-%d}").mkdir(parents=True, exist_ok=True)
+    path = out / f"{eval_id}-{name}-{now:%Y%m%dT%H%M%SZ}.jsonl"
+    data = dataset.read_bytes()
+    cases = sum(1 for line in data.splitlines() if line.strip())
+    report = (f"eval: {eval_id}, Groq key: {KEY_NAME}\n"
+              f"dataset: {dataset.relative_to(Path(__file__).parent.parent)}, {cases} cases, "
+              f"sha256 {hashlib.sha256(data).hexdigest()[:12]}\n\n{report}")
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
     path.with_suffix(".txt").write_text(f"{report}\n")
     print(f"\n\n{report}\nreplies saved to {path}")

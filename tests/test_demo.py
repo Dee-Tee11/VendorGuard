@@ -274,8 +274,10 @@ def test_d19_the_panels_check_is_the_chats_last_case(api, llm_stub, demo_db):
     h = start()
     capture(api, httpx.Response(200, json=USD_PAID))
     result = lines(client.post("/demo/api/check", json=CHECK, headers=h))[-1]
-    case = demo.chat_graph.get_state(demo._thread(h["X-Demo-Session"])).values["last_case"]
-    assert case == {"case_id": result["case_id"], "policy_id": "P.VERIFIED", "signals": []} and not demo._busy
+    values = demo.chat_graph.get_state(demo._thread(h["X-Demo-Session"])).values
+    assert values["last_case"] == {"case_id": result["case_id"], "policy_id": "P.VERIFIED", "signals": [],
+                                  "price": "45.00 USD", "paid": "45.00 USD"}
+    assert values["shown"] == [] and not demo._busy  # as a chat check leaves it: no note from before the check
 
 
 def test_d19_the_panel_and_the_chat_take_turns(api, llm_stub, demo_db):

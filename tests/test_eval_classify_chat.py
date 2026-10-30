@@ -2,8 +2,8 @@
 
     pytest -m eval -v -s tests/test_eval_classify_chat.py  EVAL_REPS=3 runs each case 3 times
 
-The cases are tests/chat_dataset.jsonl. Each run saves every reply, with what was expected and what each check said,
-to tests/eval_results/chat-<UTC time>.jsonl, and the KPIs next to it in a .txt. Made-up messages only: they are all
+The cases are tests/chat_dataset.jsonl; EVAL_DATASET=next runs T7's, tests/next_steps_dataset.jsonl. Each run saves every reply, with what was expected and what each check said,
+to tests/eval_results/<UTC day>/chat-<UTC time>.jsonl, and the dataset and KPIs next to it in a .txt. Made-up messages only: they are all
 sent to Groq.
 """
 import json
@@ -15,12 +15,16 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app import chat
-from tests.test_eval_output_guardrails import KEY, calls, real_llm, save_results  # noqa: F401  (pytest fixtures)
+from tests.test_eval_output_guardrails import KEY, KEY_NAME, calls, real_llm, save_results  # noqa: F401  (pytest fixtures)
 
-pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason="needs GROQ_API_KEY_LLM_EVAL in .env")]
+pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason=f"needs {KEY_NAME} in .env")]
 
 HERE = Path(__file__).parent
-CASES = [json.loads(line) for line in (HERE / "chat_dataset.jsonl").read_text().splitlines() if line.strip()]
+# EVAL_DATASET=next runs T7: "can I ship?" and "what now?" phrasings, in English, and look-alikes that are questions
+NAME = "next" if os.getenv("EVAL_DATASET") == "next" else "chat"
+EVAL_ID = "T7" if NAME == "next" else "E06"
+DATASET = HERE / ("next_steps_dataset.jsonl" if NAME == "next" else "chat_dataset.jsonl")
+CASES = [json.loads(line) for line in DATASET.read_text().splitlines() if line.strip()]
 REPS = int(os.getenv("EVAL_REPS", "1"))
 ROWS = []
 GRAPH = chat._build(InMemorySaver())  # one graph: each case and rep has its own thread_id
@@ -41,6 +45,9 @@ def kpis(rows) -> str:
         rate("recall dispute", "intent", lambda r: r["expected"]["intent"] == "dispute"),
         rate("recall not_paypal", "intent", lambda r: r["expected"]["intent"] == "not_paypal"),
         rate("injection", "intent", lambda r: r["kind"] == "injection"),
+        rate("recall can_ship", "intent", lambda r: r["expected"]["intent"] == "can_ship"),
+        rate("recall next_steps", "intent", lambda r: r["expected"]["intent"] == "next_steps"),
+        rate("look-alikes not advised", "route", lambda r: r["kind"] == "look-alike"),
         rate("required notes", "must"),
         rate("no wrong note shown", "notes"),
         rate("no wrong note, no-note qs", "notes", lambda r: r["expected"]["route"] == "question"
@@ -57,11 +64,11 @@ def kpis(rows) -> str:
 def results():
     yield
     if ROWS:
-        save_results("chat", ROWS, kpis(ROWS))
+        save_results(EVAL_ID, NAME, ROWS, kpis(ROWS), DATASET)
 
 
 @pytest.mark.parametrize("i, rep", [(i, rep) for i in range(1, len(CASES) + 1) for rep in range(REPS)],
-                         ids=[f"{i}-{c['metadata']['kind']}-r{rep}" for i, c in enumerate(CASES, 1) for rep in range(REPS)])
+                         ids=[f"{EVAL_ID}-{i}-{c['metadata']['kind']}-r{rep}" for i, c in enumerate(CASES, 1) for rep in range(REPS)])
 def test_eval_classify_chat(monkeypatch, calls, i, rep):
     monkeypatch.setattr(chat, "TAVILY_KEY", "")  # routing only: a question must not search the web here
     case, (seen, limited, failed) = CASES[i - 1], calls

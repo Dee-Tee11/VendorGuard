@@ -19,9 +19,10 @@ def _vg(title: str, text: str, anchor: str) -> dict:
     return {"title": title, "text": text, "source_url": f"README.md#{anchor}", "retrieved_at": "2026-10-22", "verified": True}
 
 
-def _pp(title: str, text: str, url: str) -> dict:
-    # verified 2026-10-22: every sentence matched against its page's HTML by a script, then approved by the user
-    return {"title": title, "text": text, "source_url": url, "retrieved_at": "2026-10-22", "verified": True}
+def _pp(title: str, text: str, url: str, retrieved_at: str = "2026-10-22") -> dict:
+    # verified 2026-10-22: every sentence matched against its page's HTML by a script, then approved by the user.
+    # Notes added later pass the day their page was fetched; the user verified each the same day
+    return {"title": title, "text": text, "source_url": url, "retrieved_at": retrieved_at, "verified": True}
 
 
 def _partial(url: str) -> str:
@@ -71,6 +72,12 @@ POLICY_PACK = {
     "vg_already_shipped": _vg(
         "Already shipped, and the payment isn't in PayPal",
         _numbered([STEPS["P.SCAM_LIKELY"][2][2], f"If it isn't there, contact PayPal now: {CONTACT_PAYPAL}", SHIP[3]]),
+        "graph-1-scam_check",
+    ),
+    # no check needed, so not an outcome note: no sentence says the seller can ship (chat.advise's "what now?")
+    "vg_before_you_ship": _vg(
+        "Before you ship",
+        _numbered([POLICY["P.SCAM_LIKELY"], STEPS["P.SCAM_LIKELY"][2][2], *SHIP]),
         "graph-1-scam_check",
     ),
     "vg_how_to_check": _vg(
@@ -125,8 +132,8 @@ POLICY_PACK = {
         "What Seller Protection covers",
         "PayPal's Seller Protection applies to 2 types of complaints: Item not received issues filed through PayPal’s "
         "Resolution Center. Unauthorized payment issues. Requirements for Seller Protection, for physical items: "
-        "Ship the item to the address on the Transaction Details page. Provide PayPal with valid proof of shipment or delivery."
-        # skips "Respond to our requests for documentation and other information within the required timeframe."
+        "Ship the item to the address on the Transaction Details page. Respond to PayPal's requests for documentation and "
+        "other information within the required timeframe. Provide PayPal with valid proof of shipment or delivery."
         + _partial(PAYPAL_PAGES + "cshelp/article/what-is-paypal-seller-protection-help156"),
         PAYPAL_PAGES + "cshelp/article/what-is-paypal-seller-protection-help156",
     ),
@@ -143,7 +150,8 @@ POLICY_PACK = {
         "You must ship the item to the shipping address on the Transaction Details page in your PayPal account for the "
         "transaction. If you originally ship the item to the recipient’s shipping address on the Transaction Details page "
         "but the item is later redirected to a different address, you will not be eligible for PayPal’s Seller "
-        "Protection program.",
+        "Protection program. PayPal therefore recommends not using a shipping service that is arranged by the buyer, so "
+        "that you will be able to provide valid proof of shipping and delivery.",
         SELLER_PROTECTION,
     ),
     "pp_proof_of_delivery": _pp(
@@ -205,6 +213,37 @@ POLICY_PACK = {
         "dispute with the other party, you have 20 days to exchange messages using your Resolution Center. Disputes are "
         "closed automatically after 20 days unless you or the buyer escalate it.",
         PAYPAL_PAGES + "cshelp/article/i-am-a-seller---how-do-i-handle-a-dispute-or-problem-with-a-buyer-help1083",
+    ),
+    # added 2026-10-30, verified by the user the same day. Joined list items take "; " and a final "." (Vendor Guard's
+    # punctuation, not PayPal's words)
+    "pp_respond_to_dispute": _pp(
+        "How to respond to a dispute, and what to send",
+        "Go to your Resolution Center. You’ll find a list of disputes you’ve received here. Select the dispute needing "
+        "your response. Documents or info that you need to submit: a third-party shipping receipt; tracking number - or "
+        "a signature confirmation; proof of refund; other evidence to show the buyer has received the item, or "
+        "downloaded your products (in the case of digital goods). Submit your responses and supporting evidence "
+        "promptly, as this information is time sensitive.",
+        PAYPAL_PAGES + "cshelp/article/i-am-a-seller---how-do-i-handle-a-dispute-or-problem-with-a-buyer-help1083",
+        "2026-10-30",
+    ),
+    "pp_unauthorized_claim": _pp(
+        "An unauthorized payment claim and Seller Protection",
+        "In the case of Unauthorized Transaction claims, the payment must be marked “eligible” or “partially eligible” "
+        "for PayPal’s Seller Protection program on the Transaction Details page. In the case of Unauthorized Transaction "
+        "claim, you must provide valid proof of shipment or proof of delivery that demonstrates that the item was shipped "
+        "or provided to the buyer no later than two days after PayPal notified you of the dispute or reversal.",
+        SELLER_PROTECTION, "2026-10-30",
+    ),
+    "pp_proof_of_shipment": _pp(
+        "Proof of shipment when a buyer says the item didn't arrive",
+        "If a buyer claims they didn’t receive an item, you may be required to provide proof of shipment. Online or "
+        "physical documentation from a shipping company should include the recipient's name and address, as shown on "
+        "the Transaction Details page. PayPal will ask you to upload this to the Resolution Center. Transactions "
+        "processed before January 26th, 2026, and over $750.00 USD (or equivalent amounts in different currencies) "
+        "require signature confirmations. For transactions after this date, PayPal still recommends a signature "
+        "confirmation although it's not mandatory.",
+        PAYPAL_PAGES + "cshelp/article/how-do-i-prove-that-ive-sent-an-item-or-digital-goods-to-the-buyer-help177",
+        "2026-10-30",
     ),
     "pp_refund_in_paypal": _pp(
         "How to refund a buyer in PayPal",

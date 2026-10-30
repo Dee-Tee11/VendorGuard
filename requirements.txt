@@ -1,4 +1,5 @@
 fastapi==0.149.0
+starlette==1.7.0  # imported directly: RequestBodyLimitMiddleware (app/main.py)
 uvicorn[standard]==0.54.0
 httpx==0.28.1
 psycopg[binary]==3.3.6

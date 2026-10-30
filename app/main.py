@@ -14,6 +14,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import AfterValidator, BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
+from starlette.middleware.body_limit import RequestBodyLimitMiddleware
 
 from app import db, demo, llm, paypal, ratelimit, scam_check
 
@@ -37,7 +38,12 @@ async def lifespan(_):
     yield
 
 
+# the biggest body we take: a 3 MB screenshot as 4 000 000 base64 chars, plus 8 000 chars of text escaped in JSON (up
+# to 12 bytes each) and the keys. Checked on Content-Length before reading, and on the bytes read (chunked): 413
+MAX_BODY = 4_200_000
+
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(RequestBodyLimitMiddleware, max_body_size=MAX_BODY)  # RECHECK #3
 app.include_router(demo.router)
 
 
