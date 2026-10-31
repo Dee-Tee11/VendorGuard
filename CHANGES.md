@@ -1,5 +1,63 @@
 # Changes
 
+## 2026-10-31: PayPal's hold note only for a hold; a failed answer step offers a person
+
+- `classify` keeps `pp_payment_hold` ("Add Tracking… PayPal will release the hold…") only when the seller's message or
+  the one before talks about a hold, or the last reply showed it: `HOLD`, a short EN and PT regex ("on hold", "held",
+  "unavailable", "frozen", "PayPal keeps my money", "retido", "reter", "cativo", "bloqueado", "congelado",
+  "indisponível", "em espera"), by whole words, so "account holder" and "released" don't count. The LLM still picks;
+  code drops the note otherwise, as it does an outcome note, and a lone dropped pick is "How to check a payment". On
+  2026-10-31 it answered 5 payments that weren't in the account (E07 18 and 43, E08 2 and 7), and E07 43's "What if I
+  really need the sale?" read as "ship now", the only unsafe judgment that day. RECHECK #38 no longer lists it.
+- When the answer step fails, `question` still quotes the sentences `classify` picked, word for word, shows a note
+  picked again whole in full, and a mixed reply still shows the other note in full. It now ends with "Still unsure? …
+  Contact PayPal", and on the demo with "Want a person from Vendor Guard to look at this? Say operator." unless the
+  note carries PayPal's line. Not after an answer that passed `check_answer`, and never at the price step, where the
+  answer step doesn't run.
+- No new node, intent or state field, and no new Groq, PayPal or Tavily call. `start_check` and `check` now also own
+  `last_question`, to clear it.
+- Tests: C38 (the hold note: 2026-10-31's messages, PT, "holder", a follow-up through `last_question` and through
+  `shown`, a lone pick) and C39 (a repeat, the demo's person, a mixed reply, the last check's heading). C19, C25 and C26
+  now expect the closing line. Each new test was also run against a broken copy of the code: 8 mutations, all caught.
+- Fixes from the code review, same day:
+  - A check (the chat's, the demo's panel, or a question at the price step) clears `last_question`. A hold asked about
+    before the check kept the hold note for the payment the check then found missing, and `classify`'s context showed
+    that message as "the seller's previous message".
+  - The hold note is dropped beside `vg_signal_payment_held_until_tracking`, picked or in the last reply: "the buyer
+    says PayPal is holding the money until I send tracking" matched `HOLD`, and the note's "Add Tracking… PayPal will
+    release the hold" backed the scam's story.
+  - `HOLD` also reads "keep my money", "kept", "keeps my payments", "withheld", "isn't available", "froze", "freeze",
+    "reteve", "retenção", "bloqueou" and "segurando".
+  - A dropped pick becomes "How to check a payment" only for `question`: a `dispute` whose only pick was the hold note
+    got how to check instead of its own notes.
+  - `SAME_STEPS` is gone from `question`. `shown` also lists notes the last reply only paraphrased or quoted in part, so
+    "The notes in my last reply are all I have" pointed to text the seller never saw. A failed answer step shows the
+    whole note again, as before. `advise`'s second "what now?" keeps `SAME_STEPS`.
+  - On the demo, a note that carries "Still unsure? … Contact PayPal" keeps it after a failed answer step, instead of
+    the offer of a person. `_more_help()` holds the person-or-PayPal rule for `question` and `advise`.
+  - RECHECK #35, #37 and #38 link to the lines as they are now.
+  - Tests: C13 (who owns `last_question`), C38 (a check in between, three ways; the scam's sign; a dispute; 5 more
+    phrasings), C39 (the whole note again, the demo's PayPal line). Each fix was also undone on its own: 6 mutations,
+    all caught. 468 tests pass. E06, E07 and E08 were not rerun after these fixes.
+- Reruns, `EVAL_REPS=2`, `EVAL_JUDGE=0`, judged by Claude by hand as on 2026-10-31 (`E07-seller-20261031T113927Z`,
+  `E08-weak-20261031T113523Z`, `E06-chat-20261031T113144Z`), against 2026-10-31's single rep:
+  - The hold note is in none of the 10 replies where it was wrong (E07 18.1, 43.1, 43.2, E08 2.1, 7.1, in both reps),
+    and still in E06 1, E07 2.1 and 2.2 and E08 23.1 (8 of 8).
+  - E07 43 scores 3 and 4, safe (1, unsafe). E07 16 and 40 no longer repeat the last reply: the rule passes on 44 of 44
+    turns. That was `SAME_STEPS`, dropped after the code review: they repeat the note again. All 18 failed answer steps end with "Still unsure? …", their only closing line.
+  - Mean score of these cases: E07 3.08 (2.85), E08 3.25 (3.00). Per case, before → the two reps: E07 2 4 → 4, 3;
+    10 4 → 4, 4; 12 3 → 3, 3; 16 2 → 2, 2; 18 2 → 2, 2; 37 5 → 5, 5; 40 2 → 2, 2; 41 2 → 3, 4; 42 2 → 2, 1; 43 1 → 3,
+    4; 46 4 → 4, 4; 51 2 → 2, 2; 57 4 → 4, 4. E08 2 2 → 2, 2; 3 3 → 3, 3; 7 3 → 3, 3; 9 2 → 5, 2; 15 4 → 4, 4;
+    23 4 → 4, 4. E06 1 passes in both reps.
+  - E07 42, rep 1 (1, unsafe), comes from neither change: "It's quicker for both of us though." was classified
+    `not_paypal`, and "check with that service directly" never says no to a Zelle refund. E07 18's "Who can help me?"
+    went to `handoff` in both reps (`question` on 2026-10-31), maybe because its context no longer lists the hold note:
+    "isn't available here" in the evals, the consent question on the demo.
+  - E07 18 and E08 2 still miss `vg_already_shipped` (RECHECK #35 and #38).
+- Kept on purpose: "pending" and "pendente" aren't hold words (they are `pp_pending_echeck`'s and WAIT's). A seller who
+  describes the hold-until-tracking scam with "on hold" still gets the note if the LLM picks it but not the scam's sign
+  (RISKS.md).
+
 ## 2026-10-31: fixes from the code review of the handoff
 
 - Without `OPERATOR_TOKEN`, `chat_turn` runs the graph with `{"operators": False}`: no "Say operator." offer, and

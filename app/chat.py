@@ -2,11 +2,11 @@
 
 One LLM call per message picks closed choices: an intent and policy_pack keys. A follow-up answered from notes makes a
 second one, which writes 1-3 sentences that cite the notes' sentences and pass output_guardrails.check_answer, or the
-notes are quoted as before. Every other word the seller reads is written here, by scam_check, or comes from PayPal (a
-title and a link). The buyer's chat goes to scam_check.run() as typed and never reaches this module's LLM calls or
-Tavily. The price comes from the seller's own message, read by a regex. A seller who asks for a person (the human
-intent, or the word operator) is asked first whether the conversation may be shared: handoff only records the answer,
-with no LLM and no database.
+notes are quoted, then PayPal's line, or a person on the demo. Every other word the seller reads is written here, by
+scam_check, or comes from PayPal (a title and a link). The buyer's chat goes to scam_check.run() as typed and never
+reaches this module's LLM calls or Tavily. The price comes from the seller's own message, read by a regex. A seller
+who asks for a person (the human intent, or the word operator) is asked first whether the conversation may be shared:
+handoff only records the answer, with no LLM and no database.
 """
 import base64
 import binascii
@@ -186,6 +186,13 @@ TITLE_DROP = re.compile(r"[^\w .,'?!&-]")  # no [ ] ( ) : / so a title can't tur
 INSTRUCTION = re.compile(r"(?i)\b(?:ignore|disregard|forget)\b.{0,40}\b(?:instructions?|rules|prompt)\b|\bfrom now on\b"
                          r"|\balways (?:pick|choose|say|answer|tell)\b|\byou are now\b|\badmin mode\b|(?m:^\s*system\s*:)"
                          r"|\btell me (?:that )?(?:it'?s|it is|this is|the (?:buyer'?s )?payment is)\b.{0,20}\bverified\b")
+# PayPal's hold note says to add tracking and that the hold is released after delivery: classify keeps it only for a
+# seller who talks about a hold, never for a payment that isn't in the account (E07 cases 18, 43). Not "holder"
+# ponytail: common EN and PT phrasings only; a false match only keeps the LLM's pick, as before
+HOLD = re.compile(r"(?i)\b(?:hold(?:s|ing)?|(?:with)?held|unavailable|(?:isn[’']?t|not) available|froze|frozen"
+                  r"|freez(?:e|es|ing)|(?:keep(?:s|ing)?|kept) (?:my|the) (?:money|payments?|funds)"
+                  r"|retid[oa]s?|ret(?:er|ém|êm|eve)|retenç(?:ão|ões)|cativ[oa]s?|bloque(?:ad[oa]s?|ou)|congelad[oa]s?"
+                  r"|indispon[ií]ve(?:l|is)|em espera|segurando)\b")
 SENTENCE = re.compile(r"(?<=[A-Za-z)”’\"][.!?])\s+")  # not after a digit: "1. Look…" and "25.00 USD" stay whole
 # advise's backstop, read only after classify said question and never before: "what should I do if a buyer asks for
 # F&F?" is a question. fullmatch, so any other word fails ("what now if they insist?")
@@ -211,7 +218,8 @@ class State(MessagesState, total=False):  # Studio's Chat tab needs a state that
     entries: list[str]  # written by classify
     sentences: list[int]  # numbers in _listed(shown), for a follow-up; written by classify
     # context for classify's next call. Never the buyer's chat or its quotes
-    last_question: str | None  # the seller's last message that classify read, sanitized; written by classify
+    # the seller's last message that classify read, sanitized; written by classify, cleared by a check
+    last_question: str | None
     shown: list[str]  # the notes in the last reply; written by every node that replies
     # {"case_id", "policy_id", "signals", "price"?, "paid"?}: codes, and E1's two amounts as "40.00 USD", validated;
     # written by check, the demo's panel too
@@ -365,9 +373,10 @@ def _case_note(case: dict | None) -> str | None:
 
 
 def after_check(out: dict) -> dict:
-    """What a check leaves in the chat, from check() or the demo's panel: its codes, and no notes shown. Its note's
-    sentences in classify's context made the LLM apply them to another order (E07 cases 37, 51, 2026-10-30)."""
-    return {"last_case": last_case(out), "shown": []}
+    """What a check leaves in the chat, from check() or the demo's panel: its codes, no notes shown and no message
+    before it. Its note's sentences in classify's context made the LLM apply them to another order (E07 cases 37, 51,
+    2026-10-30), and a hold asked about before the check kept the hold note after it."""
+    return {"last_case": last_case(out), "shown": [], "last_question": None}
 
 
 def card(out: dict) -> str:
@@ -415,8 +424,16 @@ def classify(state):
         picked = [k for k in dict.fromkeys(choice.entries) if k in VERIFIED]
         # a verdict's note only for the seller's own last check; vg_verdicts says "You can ship", so only after a check
         case_note = _case_note(state.get("last_case"))
-        entries = [k for k in picked if k == case_note or k not in VERDICT_NOTES and (k != "vg_verdicts" or case_note)][:2]
-        out = {"intent": choice.intent, "entries": entries or (["vg_how_to_check"] if picked else []),
+        # the hold note only for a hold: in this message or the one before, or the note in the last reply (whose
+        # sentences can be quoted again anyway). Never beside the hold-until-tracking sign: that hold is the buyer's
+        # story, and the note says to add tracking
+        shown = state.get("shown") or []
+        held = ("vg_signal_payment_held_until_tracking" not in {*picked, *shown}
+                and (HOLD.search(f"{question}\n{state.get('last_question') or ''}") or "pp_payment_hold" in shown))
+        entries = [k for k in picked if (k == case_note or k not in VERDICT_NOTES and (k != "vg_verdicts" or case_note))
+                   and (k != "pp_payment_hold" or held)][:2]
+        how = ["vg_how_to_check"] if picked and choice.intent == "question" else []  # a dispute keeps its own notes
+        out = {"intent": choice.intent, "entries": entries or how,
                "sentences": [n for n in choice.sentences if isinstance(n, int)], "last_question": question}
     if out["intent"] == "question":  # the backstop, after the LLM only: written to intent, so nothing runs it again
         out["intent"] = _backstop(state | out) or "question"
@@ -442,15 +459,15 @@ def _backstop(state) -> str | None:
     return None
 
 
-@owns("messages", "awaiting", "price", "shown", "last_case")
+@owns("messages", "awaiting", "price", "shown", "last_case", "last_question")
 def start_check(state):
     text = _text(state)
     pasted = text is None or _looks_like_chat(text)
     # decoded only to pick the reply: a GIF or a broken image isn't "your screenshot" (C07)
     reply = SCREENSHOT_FIRST if _screenshot(state) is not None else (
         (PASTED if pasted else "") + ASK_PRICE + (PASTE_AGAIN if pasted else ""))
-    return _say(reply, awaiting="price", price=None,
-                shown=[], last_case=None)  # a new check: the last one no longer answers "what do I do now?"
+    # a new check: the last one no longer answers "what do I do now?", nor the message before it the next one
+    return _say(reply, awaiting="price", price=None, shown=[], last_case=None, last_question=None)
 
 
 def runs_scam_check(state, text: str | None, image: bytes | None = None) -> bool:
@@ -464,7 +481,7 @@ def runs_scam_check(state, text: str | None, image: bytes | None = None) -> bool
     return (bool(clean) or image is not None) and len(text) <= MAX_CHARS and len(clean) <= MAX_CHARS
 
 
-@owns("messages", "awaiting", "price", "shown", "last_case")
+@owns("messages", "awaiting", "price", "shown", "last_case", "last_question")
 def check(state):
     """No LLM here. scam_check runs exactly when runs_scam_check says so, with the screenshot if there is one."""
     text, image = _text(state), _screenshot(state)
@@ -497,7 +514,8 @@ def check(state):
 
 
 def _grounded(state, keys: list[str]) -> tuple[str, list[str]] | None:
-    """A follow-up's answer and the notes it cites, or None on any failure: the reply then quotes the notes."""
+    """A follow-up's answer and the notes it cites, or None on any failure: the reply then quotes the notes and offers
+    more help."""
     listed = _listed(keys)
     question = state["last_question"]  # classify's sanitized copy of this message
     user = f"<notes>\n{sanitize(chr(10).join(_numbered(listed)))}\n</notes>\n<question>\n{question}\n</question>"
@@ -544,7 +562,8 @@ def question(state):
     if items:
         # a follow-up answered by the notes just shown, in the LLM's words, from these notes only. A note not shown yet
         # is shown in full: the answer step's prompt says the seller has just read its notes
-        grounded = _grounded(state, [k for k, _ in items]) if all(sentences for _, sentences in items) else None
+        ran = all(sentences for _, sentences in items)
+        grounded = _grounded(state, [k for k, _ in items]) if ran else None
         keys = grounded[1] if grounded else [k for k, _ in items]
         parts = []
         if (case := state.get("last_case")) and _case_note(case) in keys:
@@ -552,15 +571,16 @@ def question(state):
         if grounded:  # only the notes it cites, by title and, for PayPal's, the page
             parts += [grounded[0], "From my notes: " + "; ".join(VERIFIED[k]["title"] for k in keys)
                       + "".join(_source(k) for k in keys)]
-        else:
+        else:  # the last reply may have shown only some of a note, or the answer step's words: all of it again
             parts += [_note(k, None if k in whole else sentences) for k, sentences in items]
         # at most one closing line, and at the price step it is _answer's CHECK_STOPPED. The check is offered only
-        # for a note shown in full for the first time, and never right after a check
+        # for a note shown in full for the first time, and never right after a check. A note's own PayPal line stays;
+        # else a failed answer step offers more help
         offer = (not grounded and OFFER_CHECK_AFTER & {k for k, sentences in items if sentences is None}
                  and not state.get("last_case"))
-        support = any(VERIFIED[k]["text"].endswith(scam_check.SUPPORT) for k in keys)
-        if not state.get("awaiting") and (offer or support):
-            parts.append(OFFER_CHECK if offer else scam_check.SUPPORT)
+        paypal = any(VERIFIED[k]["text"].endswith(scam_check.SUPPORT) for k in keys)
+        if not state.get("awaiting") and (offer or paypal or ran and not grounded):
+            parts.append(OFFER_CHECK if offer else scam_check.SUPPORT if paypal else _more_help())
         return _answer(state, parts, keys)
     offer = [OFFER_OPERATOR] if _operators() and not state.get("awaiting") else []  # at the price step: CHECK_STOPPED
     if pages := search(_text(state)):
@@ -611,8 +631,8 @@ def advise(state):
     keys = [k for k in keys if k in VERIFIED]
     if not ship and keys and set(keys) <= set(before):  # a second "what now?": not the same notes word for word
         lead, notes = SAME_STEPS, []
-        if close == scam_check.SUPPORT and _operators():  # nothing new to say: a person instead of PayPal's line
-            close = OFFER_OPERATOR
+        if close == scam_check.SUPPORT:  # nothing new to say
+            close = _more_help()
     else:
         notes = _notes(keys)
     parts = [*([lead] if lead else []), *notes, *([] if state.get("awaiting") else [close])]
@@ -642,6 +662,11 @@ def _operators() -> bool:
     """Only the demo has an operator page, and only it runs the graph with context={"operators": True}. The run's
     context, not configurable: LangGraph copies configurable values into every checkpoint's metadata and LangSmith's."""
     return bool((get_runtime().context or {}).get("operators"))
+
+
+def _more_help() -> str:
+    """For a reply with nothing new to say: a person on the demo, PayPal's line elsewhere."""
+    return OFFER_OPERATOR if _operators() else scam_check.SUPPORT
 
 
 @owns("messages", "awaiting", "price", "shown", "consented")

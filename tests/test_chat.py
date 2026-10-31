@@ -331,6 +331,7 @@ def test_c13_owners():
     assert {n for n, fn in nodes.items() if fn.owns & {"awaiting", "price"}} == {"start_check", "check", "question",
                                                                                  "advise", "dispute", "handoff"}
     assert {n for n, fn in nodes.items() if "last_case" in fn.owns} == {"start_check", "check"}
+    assert {n for n, fn in nodes.items() if "last_question" in fn.owns} == {"classify", "start_check", "check"}
     assert nodes["handoff"].owns == {"messages", "awaiting", "price", "shown", "consented"}
     assert [n for n, fn in nodes.items() if "consented" in fn.owns] == ["handoff"]
     assert list(chat.graph.get_input_jsonschema()["properties"]) == ["messages"]
@@ -538,7 +539,7 @@ def test_c19_a_note_just_shown_answers_with_its_picked_sentences_word_for_word(c
     choice.sentences = [5, 99, 0, 5]  # out of range and repeated numbers are dropped
     entry = chat.VERIFIED["pp_refund_in_paypal"]
     assert talk("Do I get my fees back?") == (f"{entry['title']}\nBut PayPal doesn't return the fees you paid when you "
-                                              f"got the payment.\nSource: {entry['source_url']}")
+                                              f"got the payment.\nSource: {entry['source_url']}\n\n{scam_check.SUPPORT}")
     assert talk.state["shown"] == ["pp_refund_in_paypal"]
 
 
@@ -735,7 +736,8 @@ def invalid():
 ])
 def test_c25_any_failure_quotes_the_notes_as_before(choice, talk, answer):
     sentence = chat._listed(["pp_friends_and_family"])[1][1]
-    assert ff_follow_up(choice, talk, answer) == f"{FF['title']}\n{sentence}\nSource: {FF['source_url']}"
+    assert ff_follow_up(choice, talk, answer) == (f"{FF['title']}\n{sentence}\nSource: {FF['source_url']}"
+                                                  f"\n\n{scam_check.SUPPORT}")
     assert len(choice.answers) == 1
 
 
@@ -760,7 +762,7 @@ def test_c26_a_shown_note_picked_again_is_a_follow_up_on_all_of_it(choice, talk)
     assert reply == f"{GOOD[0][0]} {GOOD[1][0]}\n\nFrom my notes: {FF['title']}\nSource: {FF['source_url']}"
     assert choice.answers[0].user.startswith("<notes>\n" + "\n".join(chat._numbered(chat._listed(["pp_friends_and_family"]))))
     choice.answer = []  # rejected: the whole note again, never DONT_KNOW
-    assert talk("And then?") == f"{FF['title']}\n{FF['text']}\nSource: {FF['source_url']}"
+    assert talk("And then?") == f"{FF['title']}\n{FF['text']}\nSource: {FF['source_url']}\n\n{scam_check.SUPPORT}"
 
 
 def test_c26_a_gated_pick_of_the_note_just_shown_is_not_dont_know(choice, talk):  # E07 case 40
@@ -1067,6 +1069,128 @@ def test_c37_at_the_price_step_the_only_closing_line_is_check_stopped(choice, de
     demo_talk("check")
     choice.intent = "question"
     assert demo_talk("Can I sell gift cards?") == f"{chat.DONT_KNOW}\n\n{chat.CHECK_STOPPED}"
+
+
+HOLD_TITLE = chat.VERIFIED["pp_payment_hold"]["title"]
+
+
+@pytest.mark.parametrize("message, kept", [
+    ("Why is my payment on hold?", True),
+    ("My money from a sale is on hold. Can I ship anyway?", True),
+    ("O PayPal está a reter o meu dinheiro", True),
+    ("my money is unavailable", True),
+    ("Why does PayPal keep my money?", True),
+    ("PayPal kept my payments", True),
+    ("PayPal withheld my payment", True),
+    ("The money isn't available yet", True),
+    ("O PayPal reteve o pagamento", True),
+    ("I already shipped the item and now I think it was a scam: the payment isn't in my account. What do I do?", False),
+    ("The buyer wants me to ship today and says they'll pay tomorrow. They seem legit. Is that OK?", False),
+    ("I got an email that looks like it's from PayPal saying the buyer's payment is complete, but I don't see it in my "
+     "account.", False),
+    ("PayPal says the account holder reported my buyer's payment as unauthorized. What happens now?", False),
+], ids=["E06 1", "E08 23", "reter", "unavailable", "keep", "kept", "withheld", "isn't available", "reteve", "E07 18",
+        "E07 43", "E08 7", "holder"])
+def test_c38_the_hold_note_only_when_the_seller_talks_about_a_hold(choice, talk, message, kept):
+    choice.intent, choice.entries = "question", ["pp_fake_emails", "pp_payment_hold"]
+    reply = talk(message)
+    assert talk.state["entries"] == ["pp_fake_emails", "pp_payment_hold"][:1 + kept]
+    assert (HOLD_TITLE in reply) is kept
+
+
+def test_c38_a_follow_up_keeps_the_hold_note(choice, talk, monkeypatch):
+    monkeypatch.setattr(chat, "TAVILY_KEY", "")
+    choice.intent = "question"
+    talk("My money from a sale is on hold.")  # no note picked
+    choice.entries = ["pp_payment_hold"]
+    assert HOLD_TITLE in talk("How long will it take?")  # the message before talks about a hold
+    talk("And after that?")  # neither message does, but the last reply showed it
+    assert talk.state["entries"] == ["pp_payment_hold"]
+
+
+def test_c38_a_lone_hold_pick_without_a_hold_is_how_to_check(choice, talk):  # E07 case 43
+    choice.intent, choice.entries = "question", ["vg_before_you_ship"]
+    talk("The buyer wants me to ship today and says they'll pay tomorrow. Is that OK?")
+    choice.entries = ["pp_payment_hold"]
+    reply = talk("What if I really need the sale?")
+    assert talk.state["entries"] == ["vg_how_to_check"] and HOLD_TITLE not in reply
+
+
+@pytest.mark.parametrize("via", ["the chat's check", "the demo's panel", "the price step"])
+def test_c38_a_check_ends_the_hold_talk_before_it(choice, talk, ran, via):
+    choice.intent, choice.entries = "question", ["pp_payment_hold"]
+    assert HOLD_TITLE in talk("Why is my payment on hold?")
+    if via == "the demo's panel":
+        talk.graph.update_state(talk.config, chat.after_check(FAKE_RESULT), as_node="check")
+    else:
+        talk("check")
+        if via == "the chat's check":
+            talk("25.00 USD")
+            talk(PAID)
+    talk("Why isn't it in my account?")  # PayPal has no record of it: never "PayPal will release the hold"
+    assert talk.state["entries"] == ["vg_how_to_check"] and "previous message" not in choice.calls[-1].user
+
+
+def test_c38_never_the_hold_note_beside_the_hold_until_tracking_sign(choice, talk, monkeypatch):
+    monkeypatch.setattr(chat, "TAVILY_KEY", "")
+    sign = "vg_signal_payment_held_until_tracking"
+    choice.intent, choice.entries = "question", [sign, "pp_payment_hold"]
+    reply = talk("The buyer says PayPal is holding the money until I send tracking. Can I ship?")
+    assert talk.state["entries"] == [sign] and HOLD_TITLE not in reply
+    choice.entries = ["pp_payment_hold"]
+    assert HOLD_TITLE not in talk("How long does the hold last?")  # the sign is in the last reply
+
+
+def test_c38_a_dispute_keeps_its_own_notes_when_the_hold_note_is_dropped(choice, talk):
+    choice.intent, choice.entries = "dispute", ["pp_payment_hold"]
+    reply = talk("The buyer opened a dispute, what happens to my money?")
+    assert talk.state["entries"] == [] and reply.startswith(chat.DISPUTE_TEXT)
+    assert all(chat.VERIFIED[k]["title"] in reply for k in chat.DISPUTE_KEYS[:2])
+
+
+@pytest.mark.parametrize("sentences", [[], [1]], ids=["the whole note", "its only sentence"])
+def test_c39_a_failed_answer_step_shows_the_note_again(choice, talk, sentences):  # E07 case 16
+    choice.intent, choice.entries = "question", ["vg_signal_off_platform"]
+    talk("The buyer asked to continue on WhatsApp instead of the marketplace chat. Is that a problem?")
+    choice.sentences = sentences  # the same text either way: the note has one sentence
+    assert talk("Why does it matter?") == f"{chat._note('vg_signal_off_platform')}\n\n{scam_check.SUPPORT}"
+    assert talk.state["shown"] == ["vg_signal_off_platform"] and len(choice.answers) == 1
+
+
+def test_c39_on_the_demo_a_failed_answer_step_offers_a_person(choice, demo_talk):  # E08 cases 9, 15
+    assert closers(ff_follow_up(choice, demo_talk, GOOD)) == []  # an answer that passed: no new closing line
+    choice.answer, choice.sentences = [], [1, 2]
+    s1, s2 = (s for _, s in chat._listed(["pp_friends_and_family"])[:2])
+    assert demo_talk("And what do they do then?") == (f"{FF['title']}\n{s1} {s2}\nSource: {FF['source_url']}"
+                                                      f"\n\n{chat.OFFER_OPERATOR}")
+    choice.entries, choice.sentences = ["pp_friends_and_family"], []
+    assert demo_talk("And then?") == f"{chat._note('pp_friends_and_family')}\n\n{chat.OFFER_OPERATOR}"
+
+
+def test_c39_on_the_demo_a_note_with_paypals_line_keeps_it(choice, demo_talk):
+    key = "vg_signal_overpayment_refund"
+    assert chat.VERIFIED[key]["text"].endswith(scam_check.SUPPORT)
+    choice.intent, choice.entries = "question", [key]
+    demo_talk("The buyer overpaid and wants the difference back. What do I do?")
+    choice.sentences = [1]  # the answer step fails: no sentences
+    assert closers(demo_talk("Why would they do that?")) == [scam_check.SUPPORT]
+
+
+def test_c39_a_mixed_fallback_quotes_one_note_and_shows_the_other_in_full(choice, talk):  # E07 case 57, E08 case 9
+    choice.intent, choice.entries = "question", ["pp_friends_and_family", "pp_ff_no_seller_protection"]
+    talk("A buyer wants to pay me with Friends and Family. Is that OK?")
+    choice.entries, choice.sentences = ["pp_ff_no_seller_protection"], [3]
+    s3 = chat._listed(["pp_friends_and_family"])[2][1]
+    assert talk("What should I tell the buyer?") == "\n\n".join(
+        [chat._note("pp_friends_and_family", [s3]), chat._note("pp_ff_no_seller_protection"), scam_check.SUPPORT])
+
+
+def test_c39_a_repeat_of_the_last_checks_note_keeps_its_heading(choice, talk):
+    talk.graph.update_state(talk.config, {"last_case": VERIFIED_CASE}, as_node="check")
+    choice.intent, choice.entries = "question", ["vg_verified"]
+    assert talk("What do I do now?").startswith("About your last check (case cccccccc):")
+    assert talk("And then?") == (f"About your last check (case cccccccc):\n\n{chat._note('vg_verified')}"
+                                 f"\n\n{scam_check.SUPPORT}")
 
 
 def test_u26_before_you_ship_is_scam_checks_own_sentences_and_never_gated():

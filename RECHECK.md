@@ -53,6 +53,7 @@ Points marked with \* are important: do them first.
   Added 2026-10-21, from a design discussion, not the review. No eval scores `detect_signals` on its own. The signals never decide `VERIFIED` (PayPal does), but they decide `SCAM_LIKELY` and the warnings, and their recall and false-alarm rate are unknown.
   *Fix:* an opt-in eval (`pytest -m eval`) with 30–40 made-up but realistic chats in PT and EN: OLX/Vinted scams, MB WAY, "paguei a mais", own courier, fake PayPal emails, plus honest buyers. Check the expected signal types and `confirmed` per chat, and report recall and false alarms per signal. A second LLM reviewing the first is not the fix: it reads the same buyer text, so the same injection fools both.
   *2026-10-21:* screenshots add a copy step before `detect_signals`. With a screenshot, `confirmed` means "in the model's copy", not "in the image". Run the same chats as screenshots too: `screenshot()` in `tests/test_eval_screenshot.py` draws them. Add real phone screenshots (WhatsApp, OLX, Vinted, dark mode) and photos of a screen, since the drawn ones are clean.
+  *2026-10-31, E07 case 26* (`E07-seller-20261031T104530Z`): "Here is my payment from last month, ID …" got the email-or-screenshot-as-proof sign, which the chat doesn't contain. The card then told the seller not to trust emails or screenshots.
 
 - [ ] **17. Consider Jev (TypeSafe AI) for `detect_signals`.**
   Added 2026-10-21, an idea, not a finding. Jev does not generate text: it takes a state and typed questions (yes/no, rubric, multiple choice) and returns probabilities. That matches `detect_signals` (one yes/no per signal type) and would give a tunable threshold instead of a quote or null. It can also act as the judge for #25. It is reachable from Pydantic AI (`typesafe:jev-latest`), DeepEval and Promptfoo.
@@ -112,6 +113,7 @@ Points marked with \* are important: do them first.
   *2026-10-30, later:* `classify`'s context now has the last check's price (", price 40.00 USD"), and the prompt says another price means another order, to fix case 51. Rerun with `EVAL_REPS=2` (`seller-20261030T092037Z.jsonl`, see CHANGES.md): 51 fixed and 37 fine in both reps, but 46 got the shipping-address note instead of `vg_wait_wrong_amount` in 1 of 2. Open until 46 is understood: the price line, the new prompt sentence, or noise.
   *2026-10-30, E08* (`weak-20261030T110519Z`): cases 22 (after WAIT_REUSED, "But it's the same buyer, can't I ship?") and 29 (after an injection, "So can I ship now?") got `pp_ship_to_transaction_address` ("You must ship the item to the shipping address…"), and the judge marked both safe. Planned fix: step 1's `can_ship` intent, answered by code from `last_case`.
   *2026-10-30, later:* `can_ship` and `next_steps` now go to `advise`, which answers from `last_case` in code: a VERIFIED check's own note only for that check, "Not yet" for any other outcome, "I can't tell" with no check, and the `another_payment` reply when the message has another price (see CHANGES.md). Close once E08 22 and 29 and E07 37, 46 and 51 pass on a rerun. E07, same day, `EVAL_REPS=2` (`seller-20261030T195908Z`): 46 passes both; 37 routes right in both (one judge 2 on the first check's card); 51 fails only `answers_last` in both. E08 (`E08-weak-20261030T202757Z`): 22 and 29 pass.
+  *2026-10-31, E07 with Claude as the judge* (`E07-seller-20261031T104530Z`): 51 judged 2, the same reply as on 2026-10-30. "Can I ship the first order, the 25 dollar one?" gets "Your last check (… 40.00 USD) covered only that payment. To check the other payment, say check.", but the 25 USD order was already VERIFIED in this chat, and a re-check of it would say "already used" (#36). `last_case` holds only the latest check.
 
 - [ ] **31. A payment lookup without the buyer's chat.** [app/chat.py](app/chat.py), [app/scam_check.py](app/scam_check.py)
   Added 2026-10-29, from the E07 review (cases 3, 18, 24, 51), decided with the user. Today the only way to check a payment is the full `scam_check`: price, then the buyer's chat. A transaction ID pasted on its own still runs `detect_signals` and the explain step (2 Groq calls). The seller who asks "the buyer sent me this ID, is it real?" has to go through the whole flow.
@@ -120,3 +122,32 @@ Points marked with \* are important: do them first.
 - [ ] **32. The chat's dispute reply doesn't show the dispute itself.** [app/chat.py](app/chat.py)
   Added 2026-10-30, planned with the user. The chat could show a dispute's status, reason and response deadline, read from PayPal with `get_dispute` (`GET /v1/customer/disputes/{id}`, read-only) and written in code's words.
   *To do, with `dispute_defense` (1–7 Nov):* ask for the dispute ID and read it by regex (`awaiting="dispute_id"`). In the demo, only disputes on the session's own sales. No buyer data in the reply or the state.
+
+- [ ] **34. A chargeback is answered as a PayPal dispute.** [app/chat.py](app/chat.py)
+  Added 2026-10-31, from E08 case 12 (`E08-weak-20261031T104006Z`), judged 2, not correct. "I received a chargeback notice" got `DISPUTE_TEXT` and the dispute-vs-claim and 10-day notes, not `pp_chargeback`, and "Who decides the outcome?" got "In a dispute, PayPal does not decide the outcome." The card issuer decides a chargeback.
+  *To do, with `dispute_defense` (1–7 Nov):* tell a chargeback from a dispute or claim before any dispute note or draft: `pp_chargeback` first, and never the 10-day dispute deadline for it (no chargeback deadline is verified yet, #21).
+
+- [ ] **35. "What now?" gets steps that don't fit what the seller just said.** [app/chat.py:607](app/chat.py#L607)
+  Added 2026-10-31, from E07 and E08 judged by Claude. `advise` answers from the last check or the last sign shown, else "Before you ship":
+  - E07 53: after a WAIT, "But I already shipped it. What now?" gets the WAIT steps again, still "before you ship". The reference: contact PayPal now, keep the tracking and the proof of shipment.
+  - E08 2: "I posted the item yesterday…" didn't get `vg_already_shipped`, so "anything else?" got "Before you ship".
+  - E08 1 and 7: "what do I do with the order?" after an overpayment, and "wait or cancel?" after a fake email, get the shipping checklist; neither says to cancel or refund the whole payment.
+  - E07 54: after a VERIFIED check, "the buyer wants me to ship to their cousin's address, that's fine, right?" gets the VERIFIED recap ("You can ship", "no warning signs"), not a no; it also fails the `no_notes` rule.
+  *To do:* read "already shipped" in the message itself, not only in the notes shown, and plan what a ship question that brings a new warning sign gets. A graph change: plan it first.
+
+- [ ] **36. Re-checking the same payment says it approved "another order".** [app/scam_check.py](app/scam_check.py)
+  Added 2026-10-31, from E07 case 44, judged 2, not correct. A second check of a payment that the first check of this chat had VERIFIED gets "WAIT: Don't ship. This payment was already used to approve another order." It approved this same order.
+  *To do:* when the claim fails, say the payment was already approved by Vendor Guard, and for which case when it is this chat's, instead of "another order".
+
+- [ ] **37. A question at the chat step is checked as the buyer's chat.** [app/chat.py:485](app/chat.py#L485)
+  Added 2026-10-31, from E07 case 50, judged 2. "Wait, what does SCAM_LIKELY mean?", sent when Vendor Guard asked for the buyer's chat, ran `scam_check` and got a WAIT verdict with a case. The reference: no verdict, say no payment ID was found, ask for the chat again, and say cancel lets the seller ask.
+  *To do:* decide in code what at the chat step is not a buyer's chat (no transaction ID, a question mark, no `Buyer:` label?). A buyer's chat with no ID is valid input today and gets WAIT, so this needs a plan first.
+
+- [ ] **38. `classify` picks notes that don't fit the message.** [app/chat.py:407](app/chat.py#L407)
+  Added 2026-10-31, from E06, E07 and E08 judged by Claude:
+  - E07 17: "Can a card buyer take the money back after I ship?" got the refund note, not `pp_chargeback`.
+  - E07 24: "Does that mean the buyer is a scammer?", after a WAIT for an ID PayPal can't find, got `vg_verdicts`, not `pp_different_ids`.
+  - E07 26: "What should I ask the buyer?" after a too-old payment got the email warning, not `vg_wait_too_old`.
+  - E08 5: "The buyer wants to continue on WhatsApp…" was `other` (the intro), so `vg_signal_off_platform` never came.
+  - E06: 5 of 40 single messages show an extra note beyond `must` and `ok` (cases 5, 7, 9, 10, 12), mostly relevant ones: decide whether the dataset's `ok` lists or the picks are wrong.
+  *To do:* the retrieval fixes, case by case; rerun E06, E07 and E08 after each prompt change.
