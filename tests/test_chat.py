@@ -63,15 +63,18 @@ def ran(monkeypatch):
 
 
 class Talk:
-    """One Studio thread: each call sends only the new message; the checkpointer keeps the rest."""
+    """One Studio thread: each call sends only the new message; the checkpointer keeps the rest. With a context, the
+    run's as the demo passes it."""
 
-    def __init__(self):
+    def __init__(self, context=None):
         self.saver = InMemorySaver()
         self.graph = chat._build(self.saver)
         self.config = {"configurable": {"thread_id": "t"}}
+        self.context = context
 
     def __call__(self, content):
-        return self.graph.invoke({"messages": [{"role": "user", "content": content}]}, self.config)["messages"][-1].content
+        return self.graph.invoke({"messages": [{"role": "user", "content": content}]}, self.config,
+                                 context=self.context)["messages"][-1].content
 
     @property
     def state(self):
@@ -81,6 +84,12 @@ class Talk:
 @pytest.fixture
 def talk():
     return Talk()
+
+
+@pytest.fixture
+def demo_talk():
+    """A thread run as the demo runs it: with an operator page."""
+    return Talk({"operators": True})
 
 
 def results(*urls, title="PayPal page"):
@@ -317,10 +326,13 @@ def test_c13_owners():
     assert all(hasattr(fn, "owns") for fn in nodes.values())
     assert [n for n, fn in nodes.items() if fn.owns & {"intent", "entries"}] == ["classify"]
     assert nodes["classify"].owns == {"intent", "entries", "sentences", "last_question"}
-    # question, advise and dispute only end a check (a question at the price step), never start one
+    # question, advise and dispute only end a check (a question at the price step), never start one; handoff ends it
+    # for its consent step
     assert {n for n, fn in nodes.items() if fn.owns & {"awaiting", "price"}} == {"start_check", "check", "question",
-                                                                                 "advise", "dispute"}
+                                                                                 "advise", "dispute", "handoff"}
     assert {n for n, fn in nodes.items() if "last_case" in fn.owns} == {"start_check", "check"}
+    assert nodes["handoff"].owns == {"messages", "awaiting", "price", "shown", "consented"}
+    assert [n for n, fn in nodes.items() if "consented" in fn.owns] == ["handoff"]
     assert list(chat.graph.get_input_jsonschema()["properties"]) == ["messages"]
 
 
@@ -585,7 +597,7 @@ def test_c20_waiting_for_the_chat_never_classifies(choice, talk, ran):
 
 
 def closers(reply: str) -> list[str]:
-    return [c for c in (chat.OFFER_CHECK, scam_check.SUPPORT, chat.CHECK_STOPPED) if c in reply]
+    return [c for c in (chat.OFFER_CHECK, scam_check.SUPPORT, chat.CHECK_STOPPED, chat.OFFER_OPERATOR) if c in reply]
 
 
 def test_c21_a_described_payment_scam_offers_the_check_once_without_starting_it(choice, talk):
@@ -965,6 +977,96 @@ def test_c33_what_now_while_waiting_for_the_chat_goes_to_the_check(choice, talk,
     choice.intent = "next_steps"
     talk("what now?")
     assert choice.calls == [] and ran == [("what now?", "25.00", "USD", None)]
+
+
+@pytest.mark.parametrize("message, calls", [("Can I talk to a real person?", 1), (" Operator ", 0)],
+                         ids=["human", "operator"])
+def test_c34_asking_for_a_person_asks_before_anything_is_shared(choice, demo_talk, message, calls):
+    choice.intent = "human"
+    assert demo_talk(message) == chat.ASK_CONSENT
+    assert demo_talk.state["awaiting"] == "consent" and demo_talk.state["consented"] is False
+    assert len(choice.calls) == calls  # the word operator never calls the LLM
+
+
+def test_c34_at_the_price_step_it_ends_the_check_and_the_question_comes_last(choice, demo_talk, ran):
+    demo_talk("check")
+    assert demo_talk("operator") == f"{chat.CHECK_STOPPED}\n\n{chat.ASK_CONSENT}"
+    assert demo_talk.state["awaiting"] == "consent" and demo_talk.state["price"] is None and not ran
+
+
+def test_c34_while_waiting_for_the_chat_operator_is_the_buyers_chat(choice, demo_talk, ran):
+    demo_talk("check")
+    demo_talk("25.00 USD")
+    demo_talk("operator")  # as "what now?" (C33): what comes at this step is the buyer's
+    assert choice.calls == [] and ran == [("operator", "25.00", "USD", None)]
+
+
+@pytest.mark.parametrize("answer", ["yes", "Yes!", "ok", "sure", "yes please", "Sim", "sim, por favor", "claro"])
+def test_c35_a_short_yes_consents_without_the_llm(choice, demo_talk, answer):
+    demo_talk("operator")
+    assert demo_talk(answer) == chat.SHARED
+    assert demo_talk.state["consented"] is True and demo_talk.state["awaiting"] is None and choice.calls == []
+
+
+@pytest.mark.parametrize("answer", ["no", "What does WAIT mean?", "yes, but what does WAIT mean?", PAID,
+                                    "Buyer: hurry up", shot()],
+                         ids=["no", "a question", "a yes with more", "a pasted chat", "chat labels", "a screenshot"])
+def test_c35_anything_else_shares_nothing_and_reaches_nothing(choice, demo_talk, tavily, ran, answer):
+    demo_talk("operator")
+    assert demo_talk(answer) == chat.NOT_SHARED
+    assert demo_talk.state["consented"] is False and demo_talk.state["awaiting"] is None
+    assert choice.calls == [] and not tavily.called and not ran
+    choice.intent, choice.entries = "question", ["vg_why_wait"]
+    assert demo_talk("What does WAIT mean?").startswith(chat.VERIFIED["vg_why_wait"]["title"])  # classified as before
+
+
+@pytest.mark.parametrize("message", ["Can I talk to a human?", "operator"])
+def test_c36_without_the_demos_context_a_person_is_demo_only(choice, talk, message):
+    choice.intent = "human"
+    assert talk(message) == chat.DEMO_ONLY
+    assert not talk.state.get("awaiting") and "consented" not in talk.state
+    talk("check")
+    assert talk(message) == f"{chat.DEMO_ONLY}\n\n{chat.CHECK_STOPPED}"  # it still ends the check
+    assert talk.state["awaiting"] is None and talk.state["price"] is None
+
+
+def test_c36_the_input_cannot_consent(choice, demo_talk):
+    """The START router sees the raw input, so a crafted step reaches handoff, which reads the filtered state."""
+    out = demo_talk.graph.invoke({"messages": [{"role": "user", "content": "yes"}], "awaiting": "consent",
+                                  "consented": True}, demo_talk.config, context=demo_talk.context)
+    assert out["messages"][-1].content == chat.ASK_CONSENT and demo_talk.state["consented"] is False
+
+
+def test_c37_a_reply_with_no_note_offers_a_person(choice, demo_talk, tavily, monkeypatch):
+    choice.intent = "question"
+    tavily.mock(return_value=results(US))
+    reply = demo_talk("Can I sell gift cards?")
+    assert reply.endswith(f"{US}\n\n{chat.OFFER_OPERATOR}") and closers(reply) == [chat.OFFER_OPERATOR]
+    monkeypatch.setattr(chat, "TAVILY_KEY", "")
+    assert demo_talk("Can I sell gift cards?") == f"{chat.DONT_KNOW}\n\n{chat.OFFER_OPERATOR}"
+    assert demo_talk("operator") == chat.ASK_CONSENT  # the offer, taken
+
+
+def test_c37_a_second_what_now_offers_a_person_instead_of_paypals_line(choice, demo_talk):
+    choice.intent, choice.entries = "question", ["vg_already_shipped"]
+    demo_talk("I already shipped and the payment isn't there")
+    choice.intent, choice.entries = "next_steps", []
+    assert demo_talk("What now?") == f"{chat.SAME_STEPS}\n\n{chat.OFFER_OPERATOR}"  # in Studio, SUPPORT (C31)
+
+
+def test_c37_after_a_scam_sign_with_no_check_the_check_offer_stays(choice, demo_talk):
+    choice.intent, choice.entries = "question", ["vg_signal_overpayment_refund"]
+    demo_talk("The buyer overpaid and wants the difference back")
+    choice.intent, choice.entries = "next_steps", []
+    demo_talk("What now?")
+    assert demo_talk("What now?") == f"{chat.SAME_STEPS}\n\n{chat.OFFER_CHECK}"
+
+
+def test_c37_at_the_price_step_the_only_closing_line_is_check_stopped(choice, demo_talk, monkeypatch):
+    monkeypatch.setattr(chat, "TAVILY_KEY", "")
+    demo_talk("check")
+    choice.intent = "question"
+    assert demo_talk("Can I sell gift cards?") == f"{chat.DONT_KNOW}\n\n{chat.CHECK_STOPPED}"
 
 
 def test_u26_before_you_ship_is_scam_checks_own_sentences_and_never_gated():

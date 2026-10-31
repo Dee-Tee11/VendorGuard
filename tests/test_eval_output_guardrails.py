@@ -25,9 +25,15 @@ from app import db, llm, scam_check
 from tests.test_scam_check import TID, capture, search
 
 ENV = dotenv_values(Path(__file__).parent.parent / ".env")
-# EVAL_KEY=2 uses GROQ_API_KEY_LLM_EVAL2, a second key for when the first one's daily quota is spent
+# EVAL_KEY=2 starts from GROQ_API_KEY_LLM_EVAL2, a second key for when the first one's daily quota is spent
 KEY_NAME = "GROQ_API_KEY_LLM_EVAL" + os.getenv("EVAL_KEY", "")
 KEY = (ENV.get(KEY_NAME) or "").strip()
+# every eval key, EVAL_KEY's first: in `calls`, a key that fails (a 429, a spent daily quota, a revoked key) hands over
+# to the next. Never the app's GROQ_API_KEY, nor the judge's: its quota is for E07's judge
+KEYS = [KEY_NAME] + [k for k, v in ENV.items() if k.startswith("GROQ_API_KEY_LLM_EVAL") and k != KEY_NAME and (v or "").strip()]
+KEY_AT = [0]  # the key in use, kept across tests, so a spent key isn't tried first again
+USED = []  # the keys that answered, for the report
+ROTATE = (groq.RateLimitError, groq.AuthenticationError, groq.PermissionDeniedError, groq.InternalServerError)
 # only the evals trace, never the offline tests: their own project, the endpoint and key from .env
 TRACING = {k: v for k, v in ENV.items() if k.startswith("LANGSMITH_") and v} | {"LANGSMITH_PROJECT": "vendorguard-evals"}
 pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason=f"needs {KEY_NAME} in .env")]
@@ -51,19 +57,27 @@ def real_llm(monkeypatch):
 
 @pytest.fixture
 def calls(monkeypatch):
-    """Each completion's total tokens, each 429 waited out, and the type of each failed llm.ask (the node then falls
-    back). No SDK retries, as in the app: a 429 waits a minute, the free tier's window, and tries once more."""
+    """Each completion's total tokens, each failed key moved past, and the type of each failed llm.ask (the node then
+    falls back). No SDK retries, as in the app: a failing key hands over to the next one in KEYS; once every key has
+    failed in a call, it waits a minute, the free tier's window. Three rounds, then the error stands."""
     seen, limited, failed = [], [], []
     monkeypatch.setattr(llm, "client", llm.client.with_options(max_retries=0))  # after real_llm (autouse)
-    create, ask = llm.client.chat.completions.create, llm.ask
+    clients, ask = [llm.client.with_options(api_key=ENV[k].strip()) for k in KEYS], llm.ask
 
     def record(**kwargs):
-        try:
-            r = create(**kwargs)
-        except groq.RateLimitError:
-            limited.append(1)
-            time.sleep(60)
-            r = create(**kwargs)
+        for tried in range(1, 3 * len(KEYS) + 1):
+            try:
+                r = clients[KEY_AT[0]].chat.completions.create(**kwargs)
+                break
+            except ROTATE:
+                limited.append(1)
+                if tried == 3 * len(KEYS):
+                    raise
+                KEY_AT[0] = (KEY_AT[0] + 1) % len(KEYS)
+                if tried % len(KEYS) == 0:
+                    time.sleep(60)
+        if KEYS[KEY_AT[0]] not in USED:
+            USED.append(KEYS[KEY_AT[0]])
         seen.append(r.usage.total_tokens)
         return r
 
@@ -81,14 +95,14 @@ def calls(monkeypatch):
 
 def save_results(eval_id: str, name: str, rows: list[dict], report: str, dataset: Path):
     """Every row to tests/eval_results/<UTC day>/<eval_id>-<name>-<UTC time>.jsonl, the KPIs next to it in a .txt that
-    starts with the eval, the Groq key's name (never its value) and the dataset: its path, case count and sha256, so a
-    run can be matched to the dataset's version."""
+    starts with the eval, the model, the Groq keys' names (never their values) and the dataset: its path, case count and
+    sha256, so a run can be matched to the dataset's version."""
     now = datetime.now(timezone.utc)
     (out := Path(__file__).parent / "eval_results" / f"{now:%Y-%m-%d}").mkdir(parents=True, exist_ok=True)
     path = out / f"{eval_id}-{name}-{now:%Y%m%dT%H%M%SZ}.jsonl"
     data = dataset.read_bytes()
     cases = sum(1 for line in data.splitlines() if line.strip())
-    report = (f"eval: {eval_id}, Groq key: {KEY_NAME}\n"
+    report = (f"eval: {eval_id}, model: {llm.MODEL}, Groq keys: {', '.join(USED) or KEY_NAME}\n"
               f"dataset: {dataset.relative_to(Path(__file__).parent.parent)}, {cases} cases, "
               f"sha256 {hashlib.sha256(data).hexdigest()[:12]}\n\n{report}")
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))

@@ -33,6 +33,17 @@ SCHEMA = (
     """CREATE TABLE IF NOT EXISTS demo_cases (
     case_id text PRIMARY KEY,
     session_id text NOT NULL REFERENCES demo_sessions ON DELETE CASCADE)""",
+    # a session's conversation, shared with a person from Vendor Guard after the seller's yes (app/chat.py handoff)
+    """CREATE TABLE IF NOT EXISTS handoffs (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    session_id text NOT NULL REFERENCES demo_sessions ON DELETE CASCADE,
+    transcript jsonb NOT NULL,
+    last_case jsonb,
+    status text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'answered')),
+    reply text,
+    shared_at timestamptz NOT NULL DEFAULT now(),
+    answered_at timestamptz)""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS handoffs_one_open ON handoffs (session_id) WHERE status = 'open'",
 )
 DEMO_IDLE = "30 minutes"  # a demo session with no request for this long is over
 # the PayPal ids of a session's sales: webhook events about them have one of these as resource.id
@@ -118,8 +129,37 @@ def add_demo_case(session_id: str, case_id: str) -> None:
         c.execute("INSERT INTO demo_cases (case_id, session_id) VALUES (%s, %s)", (case_id, session_id))
 
 
+def add_handoff(session_id: str, transcript: list[dict], last_case: dict | None) -> None:
+    """The session's open handoff now holds this transcript: a new one, or the open one updated (one open per
+    session, by handoffs_one_open). After an answer, a new one."""
+    with _connect() as c:
+        c.execute(
+            "INSERT INTO handoffs (session_id, transcript, last_case) VALUES (%s, %s, %s) "
+            "ON CONFLICT (session_id) WHERE status = 'open' "
+            "DO UPDATE SET transcript = EXCLUDED.transcript, last_case = EXCLUDED.last_case, shared_at = now()",
+            (session_id, Jsonb(transcript), Jsonb(last_case) if last_case else None),
+        )
+
+
+def open_handoffs() -> list[dict]:
+    """Every session's open handoff, oldest first, for the operator. Never the session id: it is the session's key."""
+    with _connect() as c:
+        rows = c.execute("SELECT id, transcript, last_case, shared_at FROM handoffs WHERE status = 'open' "
+                         "ORDER BY shared_at").fetchall()
+    return [{"id": r[0], "transcript": r[1], "last_case": r[2], "shared_at": r[3].isoformat()} for r in rows]
+
+
+def answer_handoff(handoff_id: int, reply: str) -> str | None:
+    """The handoff's session id if it was open (now answered with this reply), None if it was answered already or is
+    gone. The id stays on the server: it is the session's key."""
+    with _connect() as c:
+        row = c.execute("UPDATE handoffs SET status = 'answered', reply = %s, answered_at = now() "
+                        "WHERE id = %s AND status = 'open' RETURNING session_id", (reply, handoff_id)).fetchone()
+    return row[0] if row else None
+
+
 def demo_state(session_id: str) -> dict:
-    """The session's sales, and the verified webhook events about them."""
+    """The session's sales, the verified webhook events about them, and its handoffs (never their transcript)."""
     ids = {"ids": [session_id]}
     with _connect() as c:
         sales = c.execute(
@@ -128,10 +168,13 @@ def demo_state(session_id: str) -> dict:
         events = c.execute(
             "SELECT id, event_type, body->>'summary', body->'resource'->>'id', body->'resource'->>'status', received_at "
             f"FROM webhook_events WHERE body->'resource'->>'id' IN ({SALE_IDS}) ORDER BY received_at", ids).fetchall()
+        handoffs = c.execute("SELECT id, status, reply FROM handoffs WHERE session_id = ANY(%(ids)s) ORDER BY id",
+                             ids).fetchall()
     return {
         "sales": [dict(zip(("order_id", "item", "amount", "capture_id", "capture_status"), r)) for r in sales],
         "events": [{"id": e[0], "event_type": e[1], "summary": e[2], "resource_id": e[3], "status": e[4],
                     "received_at": e[5].isoformat()} for e in events],
+        "handoffs": [dict(zip(("id", "status", "reply"), r)) for r in handoffs],
     }
 
 
@@ -150,5 +193,6 @@ def end_demo_sessions(session_id: str | None = None) -> list[str]:
         c.execute(f"DELETE FROM claimed_payments WHERE case_id IN ({CASE_IDS})", p)
         c.execute(f"DELETE FROM scam_cases WHERE id IN ({CASE_IDS})", p)
         c.execute(f"DELETE FROM webhook_events WHERE body->'resource'->>'id' IN ({SALE_IDS})", p)
-        gone = c.execute("DELETE FROM demo_sessions WHERE id = ANY(%(ids)s) RETURNING id", p)  # cascades to sales, cases
+        # cascades to sales, cases and handoffs
+        gone = c.execute("DELETE FROM demo_sessions WHERE id = ANY(%(ids)s) RETURNING id", p)
         return [r[0] for r in gone]

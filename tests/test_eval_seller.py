@@ -35,7 +35,8 @@ from tests.test_eval_output_guardrails import ENV, KEY, KEY_NAME, calls, real_ll
 from tests.test_scam_check import TID, days_ago, search
 
 JUDGE_KEY = (ENV.get("GROQ_API_KEY_LLM_JUDGE") or "").strip()
-pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY or not JUDGE_KEY,
+JUDGE = os.getenv("EVAL_JUDGE") != "0"  # EVAL_JUDGE=0: rules only, the judge's criteria are left out (None)
+pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY or (JUDGE and not JUDGE_KEY),
                                                    reason=f"needs {KEY_NAME} and GROQ_API_KEY_LLM_JUDGE in .env")]
 
 # EVAL_DATASET=weak runs E08: the same harness on the cases E07 failed most (scenarios as E07's), saved as E08-weak-*
@@ -228,14 +229,15 @@ def test_eval_seller(api, monkeypatch, calls, i, rep):
                 "no_check_verdict": not any(t in reply for t in VERDICT_TEXT) if unchecked else None,
                 "no_text": not any(t in reply for t in expected["no_text"]) if "no_text" in expected else None,
             }})
-        user = f"<reference>\n{want['reference']}\n</reference>\n<conversation>\n{transcript(turns)}\n</conversation>"
-        # the judge's own key; the SDK waits out a 429 (the app's calls are retried by `calls` instead)
-        monkeypatch.setattr(llm, "client", groq.Groq(api_key=JUDGE_KEY, timeout=60, max_retries=6))
-        judge = llm.ask(Judgement, JUDGE_PROMPT, user).model_dump()
+        if JUDGE:
+            user = f"<reference>\n{want['reference']}\n</reference>\n<conversation>\n{transcript(turns)}\n</conversation>"
+            # the judge's own key; the SDK waits out a 429 (the app's calls are retried by `calls` instead)
+            monkeypatch.setattr(llm, "client", groq.Groq(api_key=JUDGE_KEY, timeout=60, max_retries=6))
+            judge = llm.ask(Judgement, JUDGE_PROMPT, user).model_dump()
     except Exception as e:  # still a row, scored as a failure, so the case stays in every KPI's count
         error = f"{type(e).__name__}: {e}"
     checks = {"rules": all(v is not False for t in turns for v in t["checks"].values()),
-              **{c: judge[c] if judge else False for c in CRITERIA}, "ran": error is None}
+              **{c: (judge[c] if judge else False) if JUDGE else None for c in CRITERIA}, "ran": error is None}
     ROWS.append({"id": i, "rep": rep, "scenario": case["metadata"]["scenario"], "kind": case["metadata"]["kind"],
                  "turns": turns, "reference": want["reference"], "judge": judge, "checks": checks,
                  "llm_calls": len(seen), "rate_limited": len(limited), "errors": failed, "error": error,

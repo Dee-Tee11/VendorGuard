@@ -2,7 +2,7 @@
 
     pytest -m eval -v -s tests/test_eval_classify_chat.py  EVAL_REPS=3 runs each case 3 times
 
-The cases are tests/chat_dataset.jsonl; EVAL_DATASET=next runs T7's, tests/next_steps_dataset.jsonl. Each run saves every reply, with what was expected and what each check said,
+The cases are tests/chat_dataset.jsonl; EVAL_DATASET=next runs E10's, tests/next_steps_dataset.jsonl. Each run saves every reply, with what was expected and what each check said,
 to tests/eval_results/<UTC day>/chat-<UTC time>.jsonl, and the dataset and KPIs next to it in a .txt. Made-up messages only: they are all
 sent to Groq.
 """
@@ -20,9 +20,9 @@ from tests.test_eval_output_guardrails import KEY, KEY_NAME, calls, real_llm, sa
 pytestmark = [pytest.mark.eval, pytest.mark.skipif(not KEY, reason=f"needs {KEY_NAME} in .env")]
 
 HERE = Path(__file__).parent
-# EVAL_DATASET=next runs T7: "can I ship?" and "what now?" phrasings, in English, and look-alikes that are questions
+# EVAL_DATASET=next runs E10: "can I ship?" and "what now?" phrasings, in English, and look-alikes that are questions
 NAME = "next" if os.getenv("EVAL_DATASET") == "next" else "chat"
-EVAL_ID = "T7" if NAME == "next" else "E06"
+EVAL_ID = "E10" if NAME == "next" else "E06"
 DATASET = HERE / ("next_steps_dataset.jsonl" if NAME == "next" else "chat_dataset.jsonl")
 CASES = [json.loads(line) for line in DATASET.read_text().splitlines() if line.strip()]
 REPS = int(os.getenv("EVAL_REPS", "1"))

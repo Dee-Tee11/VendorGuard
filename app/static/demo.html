@@ -43,7 +43,7 @@
   .step.locked { opacity: .55; }
 
   label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 4px; }
-  input[type=text], input[type=number], textarea { width: 100%; padding: 9px 11px; border: 1px solid var(--rule); border-radius: 4px; background: var(--surface); }
+  input[type=text], input[type=number], input[type=password], textarea { width: 100%; padding: 9px 11px; border: 1px solid var(--rule); border-radius: 4px; background: var(--surface); }
   textarea { min-height: 150px; resize: vertical; font-size: 15px; }
   .row { display: flex; gap: 12px; flex-wrap: wrap; }
   .row > div { flex: 1 1 160px; }
@@ -112,6 +112,7 @@
   .who.graph { color: var(--ink); }
   .who.llm { color: #7a3fa0; }
   .who.error { color: var(--scam); }
+  .who.operator { color: var(--warn); }
   .log details { margin-top: 4px; }
   .log summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   .log pre { margin: 6px 0 0; padding: 10px; background: var(--paper); border-radius: 4px; font: 12.5px/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; }
@@ -124,6 +125,11 @@
   .talk li.me { align-self: flex-end; background: #e4e9f6; }
   .talk li.vg { align-self: flex-start; background: var(--paper); border: 1px solid var(--rule); }
   .talk a { color: var(--pen); }
+  .talk li.op { align-self: flex-start; background: #fbf1df; border: 1px solid #e6cf9d; }
+  .talk img { display: block; max-width: 100%; margin-top: 6px; border: 1px solid var(--rule); border-radius: 4px; }
+  .handoffs { list-style: none; margin: 12px 0 0; padding: 0; }
+  .handoffs > li { border-top: 1px solid var(--rule); padding: 14px 0; }
+  .handoffs .talk { max-height: 360px; }
   .ask { display: flex; gap: 10px; align-items: flex-end; }
   .ask textarea { min-height: 46px; height: 46px; flex: 1; }
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
@@ -197,6 +203,18 @@
           <button class="btn" id="send" type="submit">Send</button>
         </form>
         <p class="note" id="ask-note" role="status"></p>
+      </section>
+
+      <section class="step" id="operator" aria-labelledby="s5" hidden>
+        <h2 id="s5">Vendor Guard operator</h2>
+        <p>For Vendor Guard's team: the conversations sellers chose to share, from every demo session, each with an answer box. Paste the operator token to see them. It stays in this tab's memory only.</p>
+        <form class="ask" id="op-login">
+          <label class="sr-only" for="op-token">Operator token</label>
+          <input id="op-token" type="password" autocomplete="off" placeholder="Operator token">
+          <button class="btn" type="submit">Open</button>
+        </form>
+        <p class="note" id="op-note" role="status"></p>
+        <ol class="handoffs" id="handoffs"></ol>
       </section>
     </div>
 
@@ -386,6 +404,12 @@ async function refresh() {
     if (seenEvents.has(e.id)) continue;
     seenEvents.add(e.id);
     log("Webhook", "webhook", `${e.event_type}, signature verified by PayPal. ${e.summary || ""}`, e);
+  }
+  for (const h of state.handoffs || []) {  // a person's answer: shown once, apart from Vendor Guard's replies
+    if (!h.reply || seenReplies.has(h.id)) continue;
+    seenReplies.add(h.id);
+    bubble("op", `Operator: ${h.reply}`);
+    log("Operator", "operator", "A person from Vendor Guard answered the conversation you shared.", h);
   }
 }
 
@@ -592,7 +616,8 @@ function bubble(cls, text) {
 }
 
 const ROUTES = {question: "answered a question", start_check: "started a check", check: "took a step of the check",
-                dispute: "explained disputes", other: "introduced itself"};
+                dispute: "explained disputes", other: "introduced itself", advise: "advised on next steps",
+                handoff: "handled a request for a person"};
 
 let sending = false;  // one message at a time, as the server asks (409)
 async function send(message) {
@@ -624,6 +649,90 @@ async function send(message) {
   }
 }
 
+// ---- the operator: a person from Vendor Guard answers what sellers shared, from every session ----
+let operatorToken = "";  // this tab's memory only, sent in a header and never in a URL: a reload asks for it again
+const cards = new Map();  // handoff id -> shared_at on screen, so the polling never wipes a draft answer
+let polled = "";  // the note the poll wrote last, taken back by a later poll if nothing wrote over it
+const seenReplies = new Set();  // operator answers already in this page's chat
+const IMAGE = /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/;  // what the server stores; anything else isn't shown
+const WHO = {seller: "Seller", vendor_guard: "Vendor Guard", check_panel: "Check panel", operator: "Operator"};
+
+async function operatorApi(path, body) {  // not api(): a 401 here is a wrong token, not an ended session
+  const token = operatorToken;
+  const r = await fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: {"X-Operator-Token": token, "Content-Type": "application/json"},
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  // a wrong token isn't sent again every few seconds; a late 401 for an older one leaves a newer one alone
+  if (r.status === 401 && operatorToken === token) operatorToken = "";
+  if (!r.ok) throw new Error(await problem(r));
+  return r.json();
+}
+
+function caseLine(c) {
+  return [`case ${c.case_id.slice(0, 8)}`, c.policy_id, ...c.signals, c.price && `your price ${c.price}`,
+          c.paid && `PayPal shows ${c.paid}`].filter(Boolean).join(", ");
+}
+
+// the transcript holds the buyer's untrusted text: text nodes only, and an image only as a PNG or JPEG data: URL
+function card(h) {
+  const answer = el("textarea", {maxlength: "2000", placeholder: "Your answer to the seller", "aria-label": "Your answer to the seller"});
+  const send = el("button", {class: "btn", type: "submit"}, "Answer");
+  const item = el("li", {"data-id": String(h.id)},
+    el("p", {class: "caveat"}, `Shared at ${new Date(h.shared_at).toLocaleTimeString()}. `,
+      h.last_case ? `Last check: ${caseLine(h.last_case)}.` : "No check yet."),
+    el("ol", {class: "talk"}, h.transcript.map((t) => el("li", {class: {seller: "me", operator: "op"}[t.who] || "vg"},
+      el("b", {}, `${WHO[t.who] || t.who}: `), t.text,
+      typeof t.image === "string" && IMAGE.test(t.image) ? el("img", {src: t.image, alt: "The screenshot the seller sent"}) : null))),
+    el("form", {class: "ask", onsubmit: async (e) => {
+      e.preventDefault();
+      if (!answer.value.trim()) return;
+      send.disabled = true;  // a double click sends once, not a second time into a 409
+      try {
+        await operatorApi(`/demo/api/operator/handoffs/${h.id}/reply`, {reply: answer.value.trim()});
+        item.remove();
+        cards.delete(h.id);
+        note("op-note", "Sent. The seller sees it in their chat.");
+      } catch (err) {
+        note("op-note", err.message, true);
+      } finally {
+        send.disabled = false;
+      }
+    }}, answer, send));
+  return item;
+}
+
+async function refreshOperator() {
+  if (!operatorToken) return;
+  let open;
+  try { open = await operatorApi("/demo/api/operator/handoffs"); } catch (e) { return note("op-note", polled = e.message, true); }
+  const ids = new Set(open.map((h) => h.id));
+  for (const li of [...$("handoffs").children]) {
+    if (!ids.has(Number(li.dataset.id))) { li.remove(); cards.delete(Number(li.dataset.id)); }
+  }
+  for (const h of open) {
+    if (cards.get(h.id) === h.shared_at) continue;  // unchanged: the draft answer stays
+    const old = $("handoffs").querySelector(`[data-id="${h.id}"]`);
+    const fresh = card(h);
+    fresh.querySelector("textarea").value = old?.querySelector("textarea").value || "";
+    old ? old.replaceWith(fresh) : $("handoffs").append(fresh);
+    cards.set(h.id, h.shared_at);
+  }
+  if (!open.length) note("op-note", polled = "No shared conversations are waiting.");
+  else if ($("op-note").textContent === polled) note("op-note", polled = "");  // no longer true; "Sent." stays
+}
+
+$("op-login").addEventListener("submit", (e) => {
+  e.preventDefault();
+  operatorToken = $("op-token").value.trim();
+  $("op-token").value = "";
+  cards.clear();
+  $("handoffs").replaceChildren();
+  note("op-note", "");
+  refreshOperator();
+});
+
 // ---- start ----
 async function start() {
   rail();
@@ -639,9 +748,10 @@ async function start() {
   }
   $("buyer-email").textContent = session.buyer_email;
   $("buyer-password").textContent = session.buyer_password;
+  $("operator").hidden = !session.operators;
   loadPayPal();
   refresh();
-  setInterval(refresh, 4000);
+  setInterval(() => { refresh(); refreshOperator(); }, 4000);
 }
 
 document.querySelectorAll("[data-copy]").forEach((b) => b.addEventListener("click", async () => {

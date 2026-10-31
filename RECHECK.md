@@ -33,10 +33,15 @@ Points marked with \* are important: do them first.
 - [ ] **18. Screenshots go to Groq with their metadata.** [app/llm.py](app/llm.py)
   Added 2026-10-21 with the screenshot input, not from the review. The image bytes are sent as uploaded. A phone photo of a screen can carry EXIF data (GPS position, device), and so can a JPEG. With `LANGSMITH_TRACING=true` the image is also stored in the traces.
   *Fix:* before real cases, re-encode the image without metadata (Pillow would then be a runtime dependency), or reject images that carry EXIF.
+  *2026-10-30:* with the seller's yes to a handoff, the screenshots a check read are also stored in Postgres (`handoffs`), metadata included, until the session ends, for the operator page to show.
 
 - [ ] **23. The per-IP limit trusts the last `X-Forwarded-For` entry.** [app/ratelimit.py](app/ratelimit.py)
   Added 2026-10-24 with the live demo. `client_ip()` takes the last entry, assuming Render's proxy appends the caller's address after anything the caller sent. Not checked on Render. If Render puts another proxy in front, the last entry could be that proxy, and every tester would share one limit. If it doesn't append at all, a caller could forge its address.
   *Fix:* on the first deploy, send `curl -H "X-Forwarded-For: 1.2.3.4" https://<app>/demo/api/session` a few times and log what `client_ip()` sees. Then fix the rule in `client_ip()` only.
+
+- [ ] **33. One shared operator token, no identity or audit.** [app/demo.py](app/demo.py) **(depends on auth)**
+  Added 2026-10-30 with the demo's handoff. Whoever holds `OPERATOR_TOKEN` reads every open handoff, buyers' chats and screenshots included, and answers as "Operator". Nothing records who answered, and changing the token means a redeploy.
+  *Fix:* once auth lands, operator accounts, and an audit row per answer (who, when, which handoff).
 
 ## LLM output
 
@@ -60,6 +65,7 @@ Points marked with \* are important: do them first.
   *Fix:* before the chat gets an API endpoint, take the buyer's chat in a field that is not a message, or run the check on a thread with no checkpointer.
   *2026-10-25:* the chat now has a demo endpoint (`POST /demo/api/chat`). There the thread is in memory and deleted when the demo session ends or the service restarts, so nothing reaches disk. Still open for any endpoint outside the demo.
   *2026-10-27:* the thread also keeps `last_question`, the seller's last message that `classify` read (never the buyer's chat, which never reaches `classify`), and `last_case`, codes only.
+  *2026-10-30:* not fixed by the handoff, which adds to it. With `OPERATOR_TOKEN` set (since 2026-10-31, only then), the demo also keeps each session's whole conversation in memory, outside the graph (`demo._transcripts`), so a person from Vendor Guard can read it: the buyer's chat pasted at the chat step and the screenshots a check read included, never the chat pasted in the check panel. With the seller's yes to `handoff`'s question, it is stored in Postgres (`handoffs`) until the session ends, then deleted with it.
 
 - [ ] **20. Names can reach Tavily.** [app/chat.py](app/chat.py)
   Added 2026-10-22. The search query drops self-introductions ("I'm Amanda"), emails, links, phone numbers and IDs, but not other names ("my buyer John wants F&F"). Tavily's terms give it a perpetual licence over queries.

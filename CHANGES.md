@@ -1,5 +1,83 @@
 # Changes
 
+## 2026-10-31: fixes from the code review of the handoff
+
+- Without `OPERATOR_TOKEN`, `chat_turn` runs the graph with `{"operators": False}`: no "Say operator." offer, and
+  `operator` gets `DEMO_ONLY`, now "Talking to a person from Vendor Guard isn't available here for now." (it said
+  "only on the live demo page", wrong on that page). Before, a seller could share and read "Sent" with nobody able to
+  answer (D27).
+- The transcript is kept only with `OPERATOR_TOKEN` (`chat_turn`, `remember_case`): without an operator page, the
+  buyer's chat and the read screenshots are no longer held in memory for the whole session (D27).
+- The operator API counts wrong tokens: 10 an hour per IP (`"wrong token"` in `ratelimit.LIMITS`), then a 429
+  before the compare, the right token included, so a guess can't be told apart by a 200. The right token never
+  counts. `ratelimit.hit(..., count=False)` only checks (D28).
+- `POST /demo/api/operator/handoffs/{id}/reply` takes an id from 1 to 2⁶³−1: a 422, not psycopg's 500 (D25).
+- `main.demo_chat` passes its `runs_check` result to `chat_turn`, which no longer works it out a second time.
+- The operator page: the "No shared conversations are waiting." note and a poll's error go once a later poll no
+  longer bears them out ("Sent." stays); a late 401 for an older token no longer wipes a newer one; Answer is disabled
+  while it sends, so a double click doesn't end in a red 409.
+- The eval key rotation takes `GROQ_API_KEY_LLM_EVAL*` only: E07's judge keeps its own quota.
+- Kept on purpose: the operator reads the seller's text sanitised, as the check and `classify` read it ("price < 40"
+  as "price 40"), so a reply that went wrong on the cleaned text can be traced. `consented`'s comment now says it
+  stays True after the yes until `handoff` runs again; the graph is unchanged. The operator page's 4-second poll is a
+  new row in RISKS.md.
+
+## 2026-10-30: the chat offers a person and asks before handing the conversation over (`human`, `operator`, `handoff`)
+
+- A new closed intent, `human`, for a seller who asks to talk to a person. Its prompt line says that asking how to
+  contact PayPal stays `question`. The word `operator`, sent alone, is a fixed word like `notes`: `human` with no LLM
+  call.
+- Both go to a new node, `handoff`, also at the price step, where they end the check (`CHECK_STOPPED` first, so the
+  question comes last). No LLM and no database. With the run's `context` `{"operators": True}`, it lists what a person
+  from Vendor Guard would see and asks for a yes (`awaiting="consent"`). The next message always goes back to
+  `handoff`: a short EN/PT yes (`CONSENT`, `fullmatch`) sets the new state field `consented`; anything else, a pasted
+  chat or a screenshot included, shares nothing and is dropped, never classified, searched or checked. Without that
+  context (Studio, the evals) it says operators exist only on the demo page.
+- The run's `context`, not `configurable`: LangGraph 1.2 copies `configurable` values into every checkpoint's metadata
+  and, with tracing on, into LangSmith's run metadata. The context stays in the run (checked against `InMemorySaver`).
+  Only the demo passes it (`chat_turn`).
+- On the demo, a reply with no note (PayPal's pages, or "I don't have that information") ends with "Want a person from
+  Vendor Guard to look at this? Say operator.", and a second "what now?" with nothing new (`SAME_STEPS`) offers a
+  person instead of "Still unsure? … Contact PayPal". After a payment scam's sign with no check, "Say check" stays its
+  closing line; at the price step, `CHECK_STOPPED` stays the only one. Outside the demo nothing changes.
+- The demo keeps each session's transcript in memory, outside the graph (`demo._transcripts`): what the seller sent,
+  sanitised, with a screenshot only when a check read it (otherwise `[screenshot, not read]`, as #26 promised), every
+  reply, and each check panel's result card (`chat.card`, which `check` now uses too), never the buyer's chat pasted in
+  the panel. `_forget` deletes it with the thread.
+- A yes to `handoff`'s question makes `chat_turn`, after the graph, store the transcript and `last_case` in a new
+  table, `handoffs` (`db.add_handoff`). At most one is open per session (a partial unique index): a later yes updates
+  it, and one after an answer opens another. If the database refuses the row, the request is a 500 and the turn
+  doesn't join the transcript, so no "Sent" is left behind. The table goes with the session (cascade). `demo_state`
+  returns the session's handoffs (`id`, `status`, `reply`).
+- The demo page has a **Vendor Guard operator** section, shown when the server has `OPERATOR_TOKEN` (`operators` in
+  `/demo/api/session`). Whoever pastes the token (kept in the tab's memory, sent in `X-Operator-Token`, never in a
+  URL) sees every session's open handoff and answers it: `GET /demo/api/operator/handoffs` (`db.open_handoffs`, never
+  the session id) and `POST /demo/api/operator/handoffs/{id}/reply` (1–2 000 characters, 409 once answered). A wrong
+  token is a 401 before any database call, and one under 32 characters stops the app. The transcript is shown as text
+  only, a screenshot only as a PNG or JPEG `data:` URL. One shared token, no rate limit (RECHECK #33).
+- The seller's page shows each answer once in the chat, as "Operator: …", from its `/demo/api/state` poll. It never
+  enters the graph; it joins the session's transcript (`answer_handoff` returns the session id, kept on the server), so
+  a later handoff shows it. The live panel names the `advise` and `handoff` routes.
+- Tests: C13 updated, C34–C37, D20–D26, and `tests/test_db.py`'s handoffs (run against a throwaway Postgres).
+  `INTENTS` changes the schema Groq sees: rerun E06 and E10 in full, and E07 cases 37, 46 and 51 for the prompt line.
+
+## 2026-10-30: Qwen tried as `LLM_MODEL`, kept gpt-oss-120b; eval key rotation, `EVAL_JUDGE=0`
+
+- `LLM_MODEL=qwen/qwen3.8-27b`, no judge: E06 10/40 then 15/40 cases passing (gpt-oss-120b: 31/40), E10 11/36
+  (34/36). Every failure was `json_validate_failed`: Groq's strict JSON-schema mode doesn't hold on Qwen (invented keys,
+  curly quotes, loops), and two runs at temperature 0 and seed 7 differed. When its JSON was valid, E10 was 11/11.
+  `LLM_MODEL` stays `openai/gpt-oss-120b`. E07 and E08 weren't run. Its runs were deleted.
+- `calls` (`tests/test_eval_output_guardrails.py`) rotates through every `GROQ_API_KEY_LLM_*` key: a 429, a 401, a
+  403 or a 5xx hands over to the next key; once all have failed in a call it waits a minute, three rounds at most.
+  `EVAL_KEY` picks the first. Never the app's `GROQ_API_KEY`.
+- Each run's .txt starts with the model and every key that answered: `eval: E06, model: …, Groq keys: …`.
+- `EVAL_JUDGE=0` runs E07 and E08 on the rules only: the judge's criteria are None, and its key isn't needed.
+
+## 2026-10-30: T7 renamed E10
+
+- The "can I ship?" / "what now?" eval (`EVAL_DATASET=next`) is E10, not T7: runs are saved as `E10-next-…` and its
+  test IDs start with `E10`. E05 stays reserved for the planned E01–E05 set. Earlier runs keep `T7-next-…`.
+
 ## 2026-10-30: fixes from the code review of `advise`
 
 - Another order's amount is caught wherever the last check's note is about to be shown (`_answer`), not only in

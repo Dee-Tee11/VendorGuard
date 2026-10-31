@@ -32,6 +32,8 @@ async def lifespan(_):
         raise RuntimeError(f"missing env vars: {', '.join(missing)}")
     if demo.ENABLED and ".sandbox." not in paypal.BASE:  # the demo pays with a shared account: never with real money
         raise RuntimeError("DEMO_MODE needs PayPal's sandbox (PAYPAL_BASE_URL)")
+    if demo.ENABLED and demo.OPERATOR_TOKEN and len(demo.OPERATOR_TOKEN) < 32:  # it shows sellers' shared chats
+        raise RuntimeError("OPERATOR_TOKEN must be at least 32 characters")
     db.init()
     if demo.ENABLED:
         db.end_demo_sessions()  # sessions that went idle while the service slept
@@ -225,4 +227,4 @@ async def demo_chat(body: ChatIn, request: Request, session_id: str = Depends(de
     runs_check = await anyio.to_thread.run_sync(demo.runs_check, session_id, body.message, body.image)
     ratelimit.hit(request, "message", *((["check"] + (["screenshot"] if body.image else [])) if runs_check else []))
     with _slot() if runs_check else nullcontext():
-        return await anyio.to_thread.run_sync(demo.chat_turn, session_id, body.message, body.image)
+        return await anyio.to_thread.run_sync(demo.chat_turn, session_id, body.message, body.image, runs_check)

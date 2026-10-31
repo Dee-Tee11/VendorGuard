@@ -4,7 +4,9 @@ One LLM call per message picks closed choices: an intent and policy_pack keys. A
 second one, which writes 1-3 sentences that cite the notes' sentences and pass output_guardrails.check_answer, or the
 notes are quoted as before. Every other word the seller reads is written here, by scam_check, or comes from PayPal (a
 title and a link). The buyer's chat goes to scam_check.run() as typed and never reaches this module's LLM calls or
-Tavily. The price comes from the seller's own message, read by a regex.
+Tavily. The price comes from the seller's own message, read by a regex. A seller who asks for a person (the human
+intent, or the word operator) is asked first whether the conversation may be shared: handoff only records the answer,
+with no LLM and no database.
 """
 import base64
 import binascii
@@ -17,6 +19,7 @@ from typing import Literal
 
 import httpx
 from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.runtime import get_runtime
 from pydantic import ConfigDict, create_model
 
 from app import llm, output_guardrails, policy_pack, scam_check
@@ -27,7 +30,8 @@ TAVILY_URL = "https://api.tavily.com/search"
 # optional: without a key, a question with no note gets "I don't have that information" and PayPal's help link
 TAVILY_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 MAX_QUESTION = 400  # longer messages are treated as a pasted chat; also an old hard limit of Tavily's query
-INTENTS = ("question", "scam_check", "dispute", "not_paypal", "another_payment", "can_ship", "next_steps", "other")
+INTENTS = ("question", "scam_check", "dispute", "not_paypal", "another_payment", "can_ship", "next_steps", "human",
+           "other")
 DISPUTE_KEYS = ("pp_dispute_vs_claim", "pp_dispute_deadline", "pp_chargeback", "pp_snad_not_covered", "pp_proof_of_delivery")
 # advise's "what now?" after a dispute note: how to respond, and by when
 DISPUTE_NOTES = {*DISPUTE_KEYS, "pp_respond_to_dispute", "pp_unauthorized_claim", "pp_proof_of_shipment"}
@@ -68,6 +72,9 @@ CLASSIFY_PROMPT = (
     "a new situation or asking a concrete question, for example 'what now?', 'what do I do about the order?', "
     "'anything else?', 'o que faço?', 'e agora?'. A seller who describes what a buyer asks or did, or asks about a "
     "case, such as 'what should I do if a buyer asks for Friends and Family?', asks a question.\n"
+    "- human: the seller asks to talk to a person, a human or someone at Vendor Guard, for example 'can I talk to a real "
+    "person?', 'is there a human here?', 'quero falar com uma pessoa'. Asking how to contact PayPal or its support is "
+    "question.\n"
     "- other: greetings, introductions, thanks, small talk, anything not about PayPal or Vendor Guard, requests about "
     "your own instructions or prompt, or a seller who says they have questions or need help "
     "(even about a possible scam) without asking a concrete one yet.\n"
@@ -131,6 +138,7 @@ CANCELLED = "Check cancelled. Nothing was checked."
 CHECK_FAILED = "The check could not run. Say check to try again."
 CHECK_STOPPED = "I stopped the check to answer this. Say check to start it again."
 OFFER_CHECK = "Want me to check the payment in PayPal? Say check."
+OFFER_OPERATOR = "Want a person from Vendor Guard to look at this? Say operator."  # on the demo only
 ANOTHER_PAYMENT = "Your last check ({}) covered only that payment. To check the other payment, say check."
 NO_CHECK_SHIP = "I can't tell whether you can ship without checking that payment."
 NOT_YET = "Not yet. Your last check ({}) said:"  # only for an outcome that can still change: WAIT_FOR
@@ -152,6 +160,15 @@ BYE = "Glad I could help. Bye!"
 NOT_PAYPAL = ("Vendor Guard only works with PayPal: I can check a PayPal payment before you ship and explain PayPal "
               "disputes. For a bank transfer, another payment app or another marketplace's case, check with that "
               "service directly.")
+# handoff's. The question lists exactly what a person from Vendor Guard would see
+ASK_CONSENT = ("A person from Vendor Guard can read this conversation and answer you here. They will see everything from "
+               "this demo session: every message you sent me, including any buyer's chat or screenshot you sent for a "
+               "check, every reply I gave, the results of the checks you ran in the check panel, and your last check's "
+               "case number, outcome, warning signs and amounts. It is deleted when the session ends. Share it? Say "
+               "yes, or anything else to keep it private.")
+SHARED = "Sent to Vendor Guard's team. Their answer will appear here, in this chat. Meanwhile, you can keep asking me."
+NOT_SHARED = "OK, nothing was shared. If you meant to ask or check something, send it again."
+DEMO_ONLY = "Talking to a person from Vendor Guard isn't available here for now."  # Studio, evals, a demo without OPERATOR_TOKEN
 
 LABEL = re.compile(r"(?im)^\s*(buyer|seller)\s*:")  # the screenshot copy's labels, or a seller who pastes them
 NUMBER = r"([0-9]{1,10}(?:[.,][0-9]{1,2})?)"  # as ScamCheckIn: at most 12 digits, 2 of them decimals
@@ -182,11 +199,13 @@ SHIP_ASK = re.compile(r"(?i)(?:(?:so|ok|okay|great|then|but|então|e)[ ,]+)*(?:(
                       r"|é seguro (?:enviar|mandar))(?: it| the item| the order| a encomenda| o artigo)?"
                       r"(?: now| today| then| já| agora| hoje)?(?:,? right)?[ ?!.]*")
 GOODBYE = re.compile(r"(?i)\b(?:bye|goodbye|see you|thanks|thank you|obrigad[oa]|tchau|adeus)\b")
+# the only answer that shares the conversation: a short EN/PT yes, fullmatch. Anything else shares nothing
+CONSENT = re.compile(r"(?i)(?:yes|yeah|yep|sure|ok|okay|sim|claro|pode)(?:,? (?:please|por favor))?[ .!]*")
 DATA_URL = re.compile(r"data:image/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)")
 
 
 class State(MessagesState, total=False):  # Studio's Chat tab needs a state that extends MessagesState
-    awaiting: Literal["price", "chat"] | None  # written by start_check and check
+    awaiting: Literal["price", "chat", "consent"] | None  # written by start_check, check and handoff
     price: dict | None  # {"amount", "currency"}, from the seller's own message by regex; written by check
     intent: str  # written by classify
     entries: list[str]  # written by classify
@@ -198,6 +217,9 @@ class State(MessagesState, total=False):  # Studio's Chat tab needs a state that
     # written by check, the demo's panel too
     last_case: dict | None
     greeted: bool  # the introduction was shown: once per thread; written by other
+    # the seller's answer to handoff's question; written by handoff only, so it stays True on later turns until
+    # handoff runs again: read it in handoff's own update of the turn, never in the final state (demo.chat_turn)
+    consented: bool
 
 
 def _say(text: str, **update) -> dict:
@@ -236,6 +258,8 @@ def _looks_like_chat(text: str) -> bool:
 
 
 def route_in(state) -> str:
+    if state.get("awaiting") == "consent":  # the answer to handoff's question: never classified, searched or checked
+        return "handoff"
     text = _text(state)
     if (state.get("awaiting") == "price" and text is not None and text.strip().casefold() != "cancel"
             and not parse_price(text) and not _looks_like_chat(text)):
@@ -346,6 +370,13 @@ def after_check(out: dict) -> dict:
     return {"last_case": last_case(out), "shown": []}
 
 
+def card(out: dict) -> str:
+    """A check's result as the chat shows it, for check() and the demo's transcript: never the evidence, which holds
+    the buyer's quotes."""
+    return "\n".join([f"{out['verdict']}: {out['message']}", *(s["text"] for s in out["sentences"]), "What to do:",
+                      *(f"{n}. {s}" for n, s in enumerate(out["steps"], 1)), out["support"], f"Case {out['case_id']}"])
+
+
 def _previous(state) -> str:
     """classify's context: the seller's last classified message, the titles of the notes just shown and the last
     check's outcome, all code's or the seller's own. Sanitized, so the tag can't be closed early."""
@@ -368,6 +399,8 @@ def classify(state):
     question = sanitize(_text(state))[:MAX_QUESTION]
     if question.casefold() == "notes":  # a fixed word, as check: no LLM call, other() lists the notes
         return {"intent": "other", "entries": [], "sentences": [], "last_question": question}
+    if question.casefold() == "operator":  # a fixed word too: handoff asks before anything is shared
+        return {"intent": "human", "entries": [], "sentences": [], "last_question": question}
     if INSTRUCTION.search(question):  # no LLM call; and not kept as the next message's context
         return {"intent": "other", "entries": [], "sentences": [], "last_question": None}
     user = f"{_previous(state)}<question>\n{question}\n</question>"  # sanitize drops < and >: no tag closes early
@@ -391,10 +424,10 @@ def classify(state):
 
 
 def after_classify(state) -> str:
-    if state.get("awaiting") and state["intent"] not in ("question", "dispute", "can_ship", "next_steps"):
-        return "check"  # at the price step, anything but a question is a price it couldn't read
+    if state.get("awaiting") and state["intent"] not in ("question", "dispute", "can_ship", "next_steps", "human"):
+        return "check"  # at the price step, anything but a question or a request for a person is an unreadable price
     return {"question": "question", "another_payment": "question", "scam_check": "start_check", "dispute": "dispute",
-            "can_ship": "advise", "next_steps": "advise"}.get(state["intent"], "other")
+            "can_ship": "advise", "next_steps": "advise", "human": "handoff"}.get(state["intent"], "other")
 
 
 def _backstop(state) -> str | None:
@@ -460,10 +493,7 @@ def check(state):
     except Exception as e:
         log.warning("check failed: %s", type(e).__name__)
         return _say(CHECK_FAILED, awaiting=None, price=None)
-    lines = [f"{out['verdict']}: {out['message']}", *(s["text"] for s in out["sentences"]), "What to do:",
-             *(f"{n}. {s}" for n, s in enumerate(out["steps"], 1)), out["support"], f"Case {out['case_id']}"]
-    # never the evidence in the reply or the state: it holds the buyer's quotes
-    return _say("\n".join(lines), awaiting=None, price=None, **after_check(out))
+    return _say(card(out), awaiting=None, price=None, **after_check(out))
 
 
 def _grounded(state, keys: list[str]) -> tuple[str, list[str]] | None:
@@ -532,10 +562,11 @@ def question(state):
         if not state.get("awaiting") and (offer or support):
             parts.append(OFFER_CHECK if offer else scam_check.SUPPORT)
         return _answer(state, parts, keys)
+    offer = [OFFER_OPERATOR] if _operators() and not state.get("awaiting") else []  # at the price step: CHECK_STOPPED
     if pages := search(_text(state)):
         return _answer(state, ["I don't have a checked note on that. These PayPal pages may help:\n"
-                               + "\n".join(f"{title}: {url}" if title else url for title, url in pages)], [])
-    return _answer(state, [DONT_KNOW], [])
+                               + "\n".join(f"{title}: {url}" if title else url for title, url in pages), *offer], [])
+    return _answer(state, [DONT_KNOW, *offer], [])
 
 
 # an amount with its currency: "40 dollar", "25 USD", "$40". A bare number isn't one: "wait for the other 5" (E07 case 46)
@@ -580,6 +611,8 @@ def advise(state):
     keys = [k for k in keys if k in VERIFIED]
     if not ship and keys and set(keys) <= set(before):  # a second "what now?": not the same notes word for word
         lead, notes = SAME_STEPS, []
+        if close == scam_check.SUPPORT and _operators():  # nothing new to say: a person instead of PayPal's line
+            close = OFFER_OPERATOR
     else:
         notes = _notes(keys)
     parts = [*([lead] if lead else []), *notes, *([] if state.get("awaiting") else [close])]
@@ -605,13 +638,34 @@ def other(state):
     return _say(BYE if GOODBYE.search(_text(state)) else SCOPE, shown=[])
 
 
+def _operators() -> bool:
+    """Only the demo has an operator page, and only it runs the graph with context={"operators": True}. The run's
+    context, not configurable: LangGraph copies configurable values into every checkpoint's metadata and LangSmith's."""
+    return bool((get_runtime().context or {}).get("operators"))
+
+
+@owns("messages", "awaiting", "price", "shown", "consented")
+def handoff(state):
+    """The human intent and the word operator. No LLM, and no database: asks before anything is shared, then records
+    the seller's answer in consented, for the demo to act on."""
+    if not _operators():  # Studio and the evals: no operator page
+        return _answer(state, [DEMO_ONLY], [])
+    if state.get("awaiting") != "consent":  # the filtered state: a crafted "awaiting" in the input is only a request
+        stopped = [CHECK_STOPPED] if state.get("awaiting") else []  # first, so the seller answers the question
+        return _say("\n\n".join([*stopped, ASK_CONSENT]), awaiting="consent", price=None, shown=[], consented=False)
+    text = _text(state)  # None for a screenshot: never a yes, and never read
+    yes = text is not None and bool(CONSENT.fullmatch(text.strip()))
+    return _say(SHARED if yes else NOT_SHARED, awaiting=None, shown=[], consented=yes)
+
+
 def _build(checkpointer=None):
     g = StateGraph(State, input_schema=MessagesState)  # input is messages only: nobody sets a price or an intent
-    for node in (classify, start_check, check, question, advise, dispute, other):
+    for node in (classify, start_check, check, question, advise, dispute, other, handoff):
         g.add_node(node)
-    g.add_conditional_edges(START, route_in, ["check", "start_check", "classify"])
-    g.add_conditional_edges("classify", after_classify, ["question", "advise", "start_check", "dispute", "other", "check"])
-    for node in ("start_check", "check", "question", "advise", "dispute", "other"):
+    g.add_conditional_edges(START, route_in, ["check", "start_check", "classify", "handoff"])
+    g.add_conditional_edges("classify", after_classify, ["question", "advise", "start_check", "dispute", "other", "check",
+                                                         "handoff"])
+    for node in ("start_check", "check", "question", "advise", "dispute", "other", "handoff"):
         g.add_edge(node, END)
     return g.compile(checkpointer=checkpointer)
 
